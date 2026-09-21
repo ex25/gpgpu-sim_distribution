@@ -3795,6 +3795,25 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   symbol_table *symtab = NULL;
 
 #if (CUDART_VERSION >= 6000)
+  const char *override_ptx = getenv("PTX_SIM_KERNELFILE");
+  const char *use_override = getenv("PTX_SIM_USE_PTX_FILE");
+  if (override_ptx != NULL && strlen(override_ptx) != 0 &&
+      use_override != NULL && strlen(use_override) != 0) {
+    printf("GPGPU-Sim PTX: using external PTX file '%s'\n", override_ptx);
+    symtab = gpgpu_ptx_sim_load_ptx_from_filename(override_ptx);
+    api->name_symtab[fname] = symtab;
+    context->add_binary(symtab, handle);
+    api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, 0xFFFFFFFF,
+                             context->get_device()->get_gpgpu());
+    api->load_constants(symtab, STATIC_ALLOC_LIMIT,
+                        context->get_device()->get_gpgpu());
+    // ptxas cannot assemble a proposed opcode such as cais.add.u32. The
+    // execution-driven path does not need ptxas metadata to parse or execute
+    // this synthetic fixture, so leave PTXInfo unavailable for this override.
+    // A production extension must provide matching ptxas/occupancy metadata.
+    return;
+  }
+
   // loops through all ptx files from smallest sm version to largest
   std::map<unsigned, std::set<std::string> >::iterator itr_m;
   for (itr_m = api->version_filename.begin();

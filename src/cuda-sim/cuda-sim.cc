@@ -863,6 +863,7 @@ void ptx_instruction::set_opcode_and_latency() {
     case RETP_OP:
       op = RET_OPS;
       break;
+    case CAIS_ADD_OP:
     case ADD_OP:
     case ADDP_OP:
     case ADDC_OP:

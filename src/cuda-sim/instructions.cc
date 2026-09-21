@@ -987,6 +987,23 @@ void addp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI, overflow, carry);
 }
 
+void cais_add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  // Proposed single-GPU instruction used to validate the PTX extension path.
+  // It intentionally has no memory or communication side effect.
+  assert(pI->get_type() == U32_TYPE);
+
+  const operand_info &dst = pI->dst();
+  const operand_info &src1 = pI->src1();
+  const operand_info &src2 = pI->src2();
+  ptx_reg_t src1_data =
+      thread->get_operand_value(src1, dst, U32_TYPE, thread, 1);
+  ptx_reg_t src2_data =
+      thread->get_operand_value(src2, dst, U32_TYPE, thread, 1);
+  ptx_reg_t data;
+  data.u32 = src1_data.u32 + src2_data.u32;
+  thread->set_operand_value(dst, data, U32_TYPE, thread, pI, 0, 0);
+}
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t src1_data, src2_data, data;
   int overflow = 0;
