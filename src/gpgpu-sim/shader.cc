@@ -36,6 +36,8 @@
 #include <string.h>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include "../../libcuda/gpgpu_context.h"
 #include "../cuda-sim/cuda-sim.h"
 #include "../cuda-sim/ptx-stats.h"
@@ -55,6 +57,116 @@
 #define PRIORITIZE_MSHR_OVER_WB 1
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+
+namespace {
+
+// P1 bridge: emit timing-visible PTX synchronization events without coupling
+// the GPU simulator to NCCL, BookSim, or a particular transport.  The stream
+// is opt-in through PTX_SIM_EVENT_FILE and is intentionally JSONL so the P0
+// Python contract can consume it directly in a later phase.
+std::string json_escape(const std::string &value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char ch : value) {
+    switch (ch) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped += ch;
+    }
+  }
+  return escaped;
+}
+
+FILE *ptx_sync_event_file() {
+  static FILE *file = []() -> FILE * {
+    const char *path = std::getenv("PTX_SIM_EVENT_FILE");
+    if (path == nullptr || path[0] == '\0') return nullptr;
+    FILE *result = std::fopen(path, "w");
+    if (result == nullptr) {
+      std::fprintf(stderr,
+                   "WARNING: unable to open PTX_SIM_EVENT_FILE='%s'\n", path);
+    }
+    return result;
+  }();
+  return file;
+}
+
+unsigned long long next_ptx_sync_event_id() {
+  static unsigned long long next_id = 0;
+  return next_id++;
+}
+
+const char *barrier_operation(const warp_inst_t *inst) {
+  if (inst == nullptr) return "barrier";
+  switch (inst->bar_type) {
+    case SYNC:
+      return "bar.sync";
+    case ARRIVE:
+      return "bar.arrive";
+    case RED:
+      return "bar.red";
+    default:
+      return "barrier";
+  }
+}
+
+void emit_ptx_sync_event(shader_core_ctx *shader, const warp_inst_t *inst,
+                         unsigned cta_id, unsigned warp_id, const char *kind,
+                         const char *operation, const char *phase,
+                         unsigned long long cycle,
+                         unsigned barrier_id = (unsigned)-1) {
+  FILE *file = ptx_sync_event_file();
+  if (file == nullptr) return;
+
+  const shd_warp_t *warp = shader->get_warp(warp_id);
+  const kernel_info_t *kernel = shader->get_kernel();
+  const unsigned device_id = shader->get_sid();
+  const char *rank_env = std::getenv("PTX_SIM_RANK");
+  const unsigned rank = rank_env == nullptr ? device_id
+                                             : static_cast<unsigned>(std::strtoul(
+                                                   rank_env, nullptr, 10));
+  const unsigned long long event_id = next_ptx_sync_event_id();
+  const unsigned actual_barrier_id =
+      barrier_id == (unsigned)-1 && inst != nullptr ? inst->bar_id : barrier_id;
+  const unsigned long long stream_id = warp == nullptr ? 0 : warp->get_streamID();
+  const unsigned long long kernel_id = kernel == nullptr ? 0 : kernel->get_uid();
+  const std::string kernel_name =
+      kernel == nullptr ? std::string("unknown") : kernel->get_name();
+
+  std::fprintf(
+      file,
+      "{\"event_id\":\"gpu%u-sync-%llu\",\"device_id\":%u,"
+      "\"rank\":%u,\"stream_id\":\"%llu\",\"kernel_id\":\"%llu\","
+      "\"kind\":\"%s\",\"scope\":\"cta\",\"operation\":\"%s\","
+      "\"bytes\":0,\"pc\":%s,\"instruction_uid\":%s,"
+      "\"barrier_addr\":%s,\"ready_time_ps\":\"%llu\","
+      "\"metadata\":{\"phase\":\"%s\",\"time_domain\":\"sim_cycle\","
+      "\"kernel_name\":\"%s\",\"cta_id\":\"%u\",\"warp_id\":\"%u\"}}\n",
+      device_id, event_id, device_id, rank, stream_id, kernel_id, kind,
+      operation, inst == nullptr ? "null" : std::to_string(inst->pc).c_str(),
+      inst == nullptr ? "null" : std::to_string(inst->get_uid()).c_str(),
+      actual_barrier_id == (unsigned)-1
+          ? "null"
+          : std::to_string(actual_barrier_id).c_str(),
+      cycle, phase, json_escape(kernel_name).c_str(), cta_id, warp_id);
+  std::fflush(file);
+}
+
+}  // namespace
 
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
     new_addr_type addr, mem_access_type type, unsigned size, bool wr,
@@ -1122,6 +1234,11 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     kernel_info_t *kernel = m_warp[warp_id]->get_kernel_info();
     std::string kernel_name = kernel ? kernel->get_name() : "";
 
+    emit_ptx_sync_event(
+        this, next_inst, m_warp[warp_id]->get_cta_id(), warp_id,
+        "local_barrier_arrive", barrier_operation(next_inst), "issue",
+        m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+
     // Skip BAR.SYNC for nvjet (cuBLAS) kernels
     if (kernel_name.find("nvjet") == std::string::npos) {
       if (active_mask.count() != 0) {
@@ -1132,6 +1249,10 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     }
 
   } else if (next_inst->op == MEMORY_BARRIER_OP) {
+    emit_ptx_sync_event(
+        this, next_inst, m_warp[warp_id]->get_cta_id(), warp_id,
+        "memory_release", "membar", "issue",
+        m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
     m_warp[warp_id]->set_membar();
   } else if (next_inst->m_is_ldgdepbar) {  // Add for LDGDEPBAR
     m_warp[warp_id]->m_ldgdepbar_id++;
@@ -4773,6 +4894,7 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   warp_set_t at_sync = warps_in_cta & m_bar_id_to_warps[bar_id];
   warp_set_t at_arrive = warps_in_cta & m_bar_id_to_warps_arrive[bar_id];
   warp_set_t active = warps_in_cta & m_warp_active;
+  bool barrier_released = false;
 
   if (bar_count == (unsigned)-1) {
     // Check if all active warps have reached barrier (via either ARRIVE or
@@ -4783,6 +4905,7 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       m_bar_id_to_warps[bar_id] &= ~at_sync;
       m_bar_id_to_warps_arrive[bar_id] &= ~at_arrive;
       m_warp_at_barrier &= ~at_sync;
+      barrier_released = true;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_sync);
       }
@@ -4798,10 +4921,18 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       m_bar_id_to_warps[bar_id] &= ~at_sync;
       m_bar_id_to_warps_arrive[bar_id] &= ~at_arrive;
       m_warp_at_barrier &= ~at_sync;
+      barrier_released = true;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_sync);
       }
     }
+  }
+  if (barrier_released) {
+    emit_ptx_sync_event(
+        m_shader, inst, cta_id, warp_id, "barrier_wakeup",
+        barrier_operation(inst), "complete",
+        m_shader->get_gpu()->gpu_tot_sim_cycle +
+            m_shader->get_gpu()->gpu_sim_cycle, bar_id);
   }
 }
 
@@ -4901,6 +5032,10 @@ bool shader_core_ctx::warp_waiting_at_mem_barrier(unsigned warp_id) {
   if (!m_warp[warp_id]->get_membar()) return false;
   if (!m_scoreboard->pendingWrites(warp_id)) {
     m_warp[warp_id]->clear_membar();
+    emit_ptx_sync_event(
+        this, nullptr, m_warp[warp_id]->get_cta_id(), warp_id,
+        "memory_acquire", "membar", "complete",
+        m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
     if (m_gpu->get_config().flush_l1()) {
       // Mahmoud fixed this on Nov 2019
       // Invalidate L1 cache
