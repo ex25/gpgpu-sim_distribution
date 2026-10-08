@@ -308,6 +308,7 @@ class symbol_table {
   void set_name(const char *name);
   const ptx_version &get_ptx_version() const;
   unsigned get_sm_target() const;
+  const std::string &get_sm_target_string() const { return get_ptx_version().target_string(); }
   void set_ptx_version(float ver, unsigned ext);
   void set_sm_target(const char *target, const char *ext, const char *ext2);
   symbol *lookup(const char *identifier);
@@ -584,6 +585,7 @@ class operand_info {
     m_uid = get_uid();
     m_valid = true;
     m_vector = true;
+    m_vector_size = !s1 ? 0 : !s2 ? 1 : !s3 ? 2 : !s4 ? 3 : 4;
     m_type = vector_t;
     m_value.m_vector_symbolic = new const symbol *[8];
     m_value.m_vector_symbolic[0] = s1;
@@ -594,6 +596,27 @@ class operand_info {
     m_value.m_vector_symbolic[5] = NULL;
     m_value.m_vector_symbolic[6] = NULL;
     m_value.m_vector_symbolic[7] = NULL;
+    m_addr_offset = 0;
+    m_neg_pred = false;
+    m_is_return_var = false;
+    m_immediate_address = false;
+  }
+  operand_info(const std::vector<const symbol *> &symbols, gpgpu_context *ctx) {
+    init(ctx);
+    m_is_non_arch_reg = false;
+    m_addr_space = undefined_space;
+    m_operand_lohi = 0;
+    m_double_operand_type = 0;
+    m_operand_neg = false;
+    m_const_mem_offset = 0;
+    m_uid = get_uid();
+    m_valid = true;
+    m_vector = true;
+    m_vector_size = symbols.size();
+    m_type = vector_t;
+    m_value.m_vector_symbolic = new const symbol *[m_vector_size];
+    for (unsigned i = 0; i < m_vector_size; ++i)
+      m_value.m_vector_symbolic[i] = symbols[i];
     m_addr_offset = 0;
     m_neg_pred = false;
     m_is_return_var = false;
@@ -612,6 +635,7 @@ class operand_info {
     m_uid = get_uid();
     m_valid = true;
     m_vector = true;
+    m_vector_size = !s1 ? 0 : !s2 ? 1 : !s3 ? 2 : !s4 ? 3 : !s5 ? 4 : !s6 ? 5 : !s7 ? 6 : !s8 ? 7 : 8;
     m_type = vector_t;
     m_value.m_vector_symbolic = new const symbol *[8];
     m_value.m_vector_symbolic[0] = s1;
@@ -633,6 +657,7 @@ class operand_info {
     m_uid = (unsigned)-1;
     m_valid = false;
     m_vector = false;
+    m_vector_size = 0;
     m_type = undef_t;
     m_immediate_address = false;
     m_addr_space = undefined_space;
@@ -668,19 +693,11 @@ class operand_info {
 
   unsigned get_vect_nelem() const {
     assert(is_vector());
-    if (!m_value.m_vector_symbolic[0]) return 0;
-    if (!m_value.m_vector_symbolic[1]) return 1;
-    if (!m_value.m_vector_symbolic[2]) return 2;
-    if (!m_value.m_vector_symbolic[3]) return 3;
-    if (!m_value.m_vector_symbolic[4]) return 4;
-    if (!m_value.m_vector_symbolic[5]) return 5;
-    if (!m_value.m_vector_symbolic[6]) return 6;
-    if (!m_value.m_vector_symbolic[7]) return 7;
-    return 8;
+    return m_vector_size;
   }
 
   const symbol *vec_symbol(int idx) const {
-    assert(idx < 8);
+    assert(idx >= 0 && (unsigned)idx < m_vector_size);
     const symbol *result = m_value.m_vector_symbolic[idx];
     assert(result != NULL);
     return result;
@@ -861,6 +878,7 @@ class operand_info {
   unsigned m_uid;
   bool m_valid;
   bool m_vector;
+  unsigned m_vector_size;
   enum operand_type m_type;
   bool m_immediate_address;
   enum _memory_space_t m_addr_space;
@@ -1100,7 +1118,7 @@ class ptx_instruction : public warp_inst_t {
 
   bool has_memory_read() const {
     if (m_opcode == LD_OP || m_opcode == LDU_OP || m_opcode == TEX_OP ||
-        m_opcode == MMA_LD_OP)
+        m_opcode == MMA_LD_OP || m_opcode == LDMATRIX_OP)
       return true;
     // Check PTXPlus operand type below
     // Source operands are memory operands

@@ -576,6 +576,9 @@ std::string cuda_sim::ptx_get_insn_str(address_type pc) {
 
 void ptx_instruction::set_fp_or_int_archop() {
   oprnd_type = UN_OP;
+  if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
+      m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
+      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP) return;
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
@@ -600,6 +603,9 @@ void ptx_instruction::set_fp_or_int_archop() {
 
 void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
+  if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
+      m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
+      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP) return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
       (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
@@ -1022,6 +1028,15 @@ void ptx_instruction::set_opcode_and_latency() {
       latency = int_latency[5];
       initiation_interval = int_init[5];
       break;
+    case LDMATRIX_OP:
+    case MMA_SYNC_OP:
+    case WGMMA_MMA_OP:
+    case WGMMA_FENCE_OP:
+    case WGMMA_COMMIT_OP:
+    case WGMMA_WAIT_OP:
+      // These carry frontend metadata only; timing fetch fails explicitly.
+      op = NO_OP;
+      break;
     default:
       break;
   }
@@ -1048,13 +1063,19 @@ static unsigned datatype2size(unsigned data_type) {
     case S16_TYPE:
     case U16_TYPE:
     case F16_TYPE:
+    case BF16_TYPE:
       data_size = 2;
       break;
     case B32_TYPE:
     case S32_TYPE:
     case U32_TYPE:
     case F32_TYPE:
+    case TF32_TYPE:
       data_size = 4;
+      break;
+    case E4M3_TYPE:
+    case E5M2_TYPE:
+      data_size = 1;
       break;
     case B64_TYPE:
     case BB64_TYPE:
@@ -1164,6 +1185,10 @@ void ptx_instruction::pre_decode() {
   ptx_instruction::const_iterator opr = op_iter_begin();
   for (; opr != op_iter_end(); opr++, n++) {  // process operands
     const operand_info &o = *opr;
+    if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
+        m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
+        m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP)
+      continue;
     if (has_dst && n == 0) {
       // Do not set the null register "_" as an architectural register
       if (o.is_reg() && !o.is_non_arch_reg()) {
@@ -1785,7 +1810,7 @@ static unsigned get_tex_datasize(const ptx_instruction *pI,
 
 int tensorcore_op(int inst_opcode) {
   if ((inst_opcode == MMA_OP) || (inst_opcode == MMA_LD_OP) ||
-      (inst_opcode == MMA_ST_OP))
+      (inst_opcode == MMA_ST_OP) || (inst_opcode == LDMATRIX_OP))
     return 1;
   else
     return 0;
@@ -1844,8 +1869,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
         pI = pJ;
       }
 
-      if (((inst_opcode == MMA_OP || inst_opcode == MMA_LD_OP ||
-            inst_opcode == MMA_ST_OP))) {
+      if (tensorcore_op(inst_opcode)) {
         if (inst.active_count() != MAX_WARP_SIZE) {
           printf(
               "Tensor Core operation are warp synchronous operation. All the "
@@ -1919,7 +1943,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     _memory_op_t insn_memory_op = no_memory_op;
     unsigned insn_data_size = 0;
     if ((pI->has_memory_read() || pI->has_memory_write())) {
-      if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
+      if (!(inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP ||
+            inst_opcode == LDMATRIX_OP)) {
         insn_memaddr = last_eaddr();
         insn_space = last_space();
         unsigned to_type = pI->get_type();
@@ -2030,7 +2055,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
 
     // "Return values"
     if (!skip) {
-      if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
+      if (!(inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP ||
+            inst_opcode == LDMATRIX_OP)) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);
         inst.data_size = insn_data_size;  // simpleAtomicIntrinsics
@@ -2056,7 +2082,14 @@ const struct gpgpu_ptx_sim_info *ptx_sim_kernel_info(
 }
 
 const warp_inst_t *gpgpu_context::ptx_fetch_inst(address_type pc) {
-  return pc_to_instruction(pc);
+  const ptx_instruction *inst = pc_to_instruction(pc);
+  if (inst->ptx_matrix.kind != ptx_matrix_metadata::NONE &&
+      !inst->ptx_matrix.timing_supported) {
+    fprintf(stderr, "%s:%u: PTX matrix timing is not implemented: %s\n",
+            inst->source_file(), inst->source_line(), inst->get_source());
+    abort();
+  }
+  return inst;
 }
 
 unsigned ptx_sim_init_thread(kernel_info_t &kernel,

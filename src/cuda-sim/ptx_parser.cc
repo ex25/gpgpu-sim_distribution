@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "ptx_parser.h"
+#include <regex>
 #include "../../libcuda/gpgpu_context.h"
 #include "ptx_ir.h"
 
@@ -95,6 +96,8 @@ void ptx_recognizer::init_instruction_state() {
   g_opcode = -1;
   g_options.clear();
   g_wmma_options.clear();
+  g_vector_operands.clear();
+  g_matrix_opcode.clear();
   g_return_var = operand_info(gpgpu_ctx);
   init_directive_state();
 }
@@ -137,10 +140,14 @@ symbol_table *gpgpu_context::init_parser(const char *ptx_filename) {
   FILE *ptx_in;
   ptx_in = fopen(ptx_filename, "r");
   ptx_set_in(ptx_in, ptx_parser->scanner);
-  ptx_parse(ptx_parser->scanner, ptx_parser);
+  const int parse_result = ptx_parse(ptx_parser->scanner, ptx_parser);
   ptx_in = ptx_get_in(ptx_parser->scanner);
   ptx_lex_destroy(ptx_parser->scanner);
   fclose(ptx_in);
+  if (parse_result != 0 || ptx_parser->g_error_detected) {
+    fprintf(stderr, "%s: PTX parsing failed; refusing partial module\n", ptx_filename);
+    exit(1);
+  }
   return ptx_parser->g_global_symbol_table;
 }
 
@@ -239,7 +246,7 @@ void ptx_recognizer::parse_assert_impl(int test_value, const char *file,
   vsnprintf(buf, 1024, msg, ap);
   va_end(ap);
 
-  if (test_value == 0) parse_error_impl(file, line, msg);
+  if (test_value == 0) parse_error_impl(file, line, "%s", buf);
 }
 
 void ptx_recognizer::set_return() {
@@ -261,6 +268,7 @@ const ptx_instruction *ptx_recognizer::ptx_instruction_lookup(
 }
 
 void ptx_recognizer::add_instruction() {
+  validate_matrix_operands();
   PTX_PARSE_DPRINTF("add_instruction: %s",
                     ((g_opcode > 0) ? g_opcode_string[g_opcode] : "<label>"));
   assert(g_shader_core_config != 0);
@@ -269,6 +277,30 @@ void ptx_recognizer::add_instruction() {
       g_return_var, g_options, g_wmma_options, g_scalar_type, g_space_spec,
       gpgpu_ctx->g_filename, ptx_get_lineno(scanner), linebuf,
       g_shader_core_config, gpgpu_ctx);
+  if (!g_matrix_opcode.empty()) {
+    i->ptx_matrix.opcode = g_matrix_opcode;
+    if (g_opcode == LDMATRIX_OP) {
+      i->ptx_matrix.kind = ptx_matrix_metadata::LDMATRIX;
+      i->ptx_matrix.m = i->ptx_matrix.n = 8;
+      i->ptx_matrix.matrices = g_operands.front().get_vect_nelem();
+      i->ptx_matrix.transpose = g_matrix_opcode.find(".trans.") != std::string::npos;
+      i->ptx_matrix.functional_supported = true;
+    } else {
+      i->ptx_matrix.kind = g_opcode == MMA_SYNC_OP
+                              ? ptx_matrix_metadata::MMA_SYNC
+                              : ptx_matrix_metadata::WGMMA;
+      if (g_opcode == WGMMA_MMA_OP) {
+        i->ptx_matrix.m = 64;
+        i->ptx_matrix.n = g_matrix_opcode.find("n176") != std::string::npos ? 176 : 128;
+        i->ptx_matrix.k = 16;
+      }
+    }
+    if (!g_operands.empty() && g_operands.front().is_vector()) {
+      const operand_info &dst = g_operands.front();
+      for (unsigned r = 0; r < dst.get_vect_nelem(); ++r)
+        i->ptx_matrix.accumulator_registers.push_back(dst.vec_symbol(r)->reg_num());
+    }
+  }
   g_instructions.push_back(i);
   g_inst_lookup[gpgpu_ctx->g_filename][ptx_get_lineno(scanner)] = i;
   init_instruction_state();
@@ -587,6 +619,9 @@ void ptx_recognizer::add_vector_spec(int spec) {
 }
 
 void ptx_recognizer::add_scalar_type_spec(int type_spec) {
+  if (type_spec == BF16_TYPE || type_spec == TF32_TYPE ||
+      type_spec == E4M3_TYPE || type_spec == E5M2_TYPE)
+    parse_assert(g_opcode != -1, "alternate floating formats are instruction types; declare bit registers");
   // save size of parameter
   switch (type_spec) {
     case B8_TYPE:
@@ -600,11 +635,21 @@ void ptx_recognizer::add_scalar_type_spec(int type_spec) {
     case F16_TYPE:
       g_size = 2;
       break;
+    case BF16_TYPE:
+      g_size = 2;
+      break;
     case B32_TYPE:
     case S32_TYPE:
     case U32_TYPE:
     case F32_TYPE:
       g_size = 4;
+      break;
+    case TF32_TYPE:
+      g_size = 4;
+      break;
+    case E4M3_TYPE:
+    case E5M2_TYPE:
+      g_size = 1;
       break;
     case B64_TYPE:
     case BB64_TYPE:
@@ -645,6 +690,122 @@ void ptx_recognizer::add_label(const char *identifier) {
 }
 
 void ptx_recognizer::add_opcode(int opcode) { g_opcode = opcode; }
+
+void ptx_recognizer::begin_vector_operand(const char *identifier) {
+  g_vector_operands.clear();
+  g_vector_operands.push_back(identifier);
+}
+
+void ptx_recognizer::append_vector_operand(const char *identifier) {
+  g_vector_operands.push_back(identifier);
+}
+
+void ptx_recognizer::finish_vector_operand() {
+  parse_assert(!g_vector_operands.empty() && g_vector_operands.size() <= 128,
+               "vector tuple must contain between 1 and 128 operands");
+  if (g_matrix_opcode.empty())
+    parse_assert(g_vector_operands.size() == 1 || g_vector_operands.size() == 2 ||
+                 g_vector_operands.size() == 3 || g_vector_operands.size() == 4 ||
+                 g_vector_operands.size() == 8, "unsupported legacy vector tuple length");
+  std::vector<const symbol *> symbols;
+  for (std::vector<std::string>::const_iterator i = g_vector_operands.begin();
+       i != g_vector_operands.end(); ++i) {
+    const symbol *s = g_current_symbol_table->lookup(i->c_str());
+    parse_assert(s != NULL, "vector component is not declared: %s", i->c_str());
+    const symbol *null_op = g_current_symbol_table->lookup("_");
+    symbols.push_back(s == null_op ? NULL : s);
+  }
+  g_operands.push_back(operand_info(symbols, gpgpu_ctx));
+  g_vector_operands.clear();
+}
+
+void ptx_recognizer::add_matrix_opcode(const char *opcode) {
+  std::string text(opcode);
+  if (std::regex_match(text, std::regex(
+          "ldmatrix\\.sync\\.aligned\\.m8n8\\.x[124](\\.trans)?\\.shared(::cta)?\\.b16"))) {
+    g_opcode = LDMATRIX_OP;
+  } else if (text == "wgmma.fence.sync.aligned") {
+    g_opcode = WGMMA_FENCE_OP;
+  } else if (text == "wgmma.commit_group.sync.aligned") {
+    g_opcode = WGMMA_COMMIT_OP;
+  } else if (text == "wgmma.wait_group.sync.aligned") {
+    g_opcode = WGMMA_WAIT_OP;
+  } else if (std::regex_match(text, std::regex(
+                 "wgmma\\.mma_async\\.sync\\.aligned\\.m64n(128|176)k16\\.f32\\.f16\\.f16"))) {
+    g_opcode = WGMMA_MMA_OP;
+  } else if (text == "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" ||
+             text == "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32" ||
+             text == "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32" ||
+             text == "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32" ||
+             text == "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32") {
+    g_opcode = MMA_SYNC_OP;
+  } else {
+    parse_assert(0, "unsupported matrix opcode/modifier: %s", opcode);
+  }
+  g_options.clear();
+  g_wmma_options.clear();
+  g_scalar_type.clear();
+  g_matrix_opcode = text;
+  if (g_opcode == LDMATRIX_OP) {
+    g_space_spec = shared_space;
+    g_scalar_type.push_back(B16_TYPE);
+  }
+}
+
+void ptx_recognizer::validate_matrix_operands() {
+  if (g_matrix_opcode.empty()) return;
+  std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+  const auto tuple = [&](unsigned pos, unsigned count, int type) {
+    parse_assert(pos < ops.size() && ops[pos].is_vector() &&
+                 ops[pos].get_vect_nelem() == count, "matrix register tuple length mismatch");
+    std::set<const symbol *> seen;
+    for (unsigned r = 0; r < count; ++r) {
+      const symbol *s = ops[pos].vec_symbol(r);
+      parse_assert(s && s->is_reg() && s->type()->get_key().scalar_type() == type,
+                   "matrix tuple requires registers of the specified bit width/type");
+      parse_assert(seen.insert(s).second, "duplicate register in matrix tuple");
+    }
+  };
+  const auto reg = [&](unsigned pos, unsigned bits) {
+    parse_assert(pos < ops.size() && ops[pos].is_reg(), "matrix operand requires a register");
+    size_t width; int basic;
+    ops[pos].get_symbol()->type()->get_key().type_decode(width, basic);
+    parse_assert(width == bits, "matrix register width mismatch");
+  };
+  if (g_opcode == LDMATRIX_OP) {
+    parse_assert(ops.size() == 2 && ops[1].is_memory_operand(), "ldmatrix requires a tuple and shared address");
+    unsigned count = g_matrix_opcode[g_matrix_opcode.find(".x") + 2] - '0';
+    tuple(0, count, B32_TYPE);
+    const symbol *address = ops[1].get_symbol();
+    parse_assert(address && (address->is_reg() || address->is_shared()), "ldmatrix address must be a register or shared symbol");
+    parse_assert(!g_pred, "predicated ldmatrix is not supported");
+  } else if (g_opcode == MMA_SYNC_OP) {
+    parse_assert(ops.size() == 4, "mma.sync requires four tuples");
+    tuple(0, 4, F32_TYPE);
+    bool tf32 = g_matrix_opcode.find("tf32") != std::string::npos;
+    tuple(1, tf32 ? 4 : 4, B32_TYPE);
+    tuple(2, 2, B32_TYPE);
+    tuple(3, 4, F32_TYPE);
+  } else if (g_opcode == WGMMA_MMA_OP) {
+    bool registers = ops.size() > 1 && ops[1].is_vector();
+    parse_assert(ops.size() == (registers ? 7 : 5), "wgmma operand count mismatch");
+    tuple(0, g_matrix_opcode.find("n176") != std::string::npos ? 88 : 64, F32_TYPE);
+    if (registers) {
+      tuple(1, 4, B32_TYPE);
+      reg(2, 64); reg(3, 1);
+      for (unsigned p = 4; p < ops.size(); ++p)
+        parse_assert(ops[p].is_literal(), "wgmma scale/transpose requires an immediate");
+    } else {
+      for (unsigned p = 1; p < ops.size(); ++p) reg(p, 64);
+    }
+  } else if (g_opcode == WGMMA_WAIT_OP) {
+    parse_assert(ops.size() == 1 && ops[0].is_literal(), "wgmma.wait_group requires one immediate");
+    int count = ops[0].get_literal_value().s32;
+    parse_assert(count >= 0 && count <= 7, "wgmma.wait_group immediate must be 0..7");
+  } else {
+    parse_assert(ops.empty(), "wgmma fence/commit take no operands");
+  }
+}
 
 void ptx_recognizer::add_pred(const char *identifier, int neg,
                               int predModifier) {

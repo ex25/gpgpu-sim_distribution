@@ -61,6 +61,7 @@ int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
 %s IN_COMMENT
 %x IN_FUNC_DECL
 %x NOT_OPCODE
+%x IN_INST
 %%
 
 abs	TC; yylval->int_value = ABS_OP; return OPCODE;
@@ -84,6 +85,8 @@ brkpt   TC; yylval->int_value = BRKPT_OP; return OPCODE;
 wmma	TC; yylval->int_value = MMA_OP; return OPCODE;
 wmma\.load	TC; yylval->int_value = MMA_LD_OP; return OPCODE;
 wmma\.store 	TC; yylval->int_value = MMA_ST_OP; return OPCODE;
+
+(ldmatrix|mma|wgmma)(\.[a-zA-Z0-9_:]+)+ TC; yylval->string_value = strdup(yytext); return MATRIX_OPCODE;
 
 call	TC; BEGIN(NOT_OPCODE); yylval->int_value = CALL_OP; return OPCODE; // blocking opcode token in case the callee has the same name as an opcode
 callp   TC; BEGIN(NOT_OPCODE); yylval->int_value = CALLP_OP; return OPCODE;
@@ -295,6 +298,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.bb64  TC;  return BB64_TYPE;
 \.bb128  TC;  return BB128_TYPE;
 \.pred TC;  return PRED_TYPE;
+\.bf16 TC; return BF16_TYPE;
+\.tf32 TC; return TF32_TYPE;
+\.e4m3 TC; return E4M3_TYPE;
+\.e5m2 TC; return E5M2_TYPE;
 
 \.texref TC; BEGIN(NOT_OPCODE); return TEXREF_TYPE;
 \.samplerref TC;  return SAMPLERREF_TYPE;

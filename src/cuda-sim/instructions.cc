@@ -167,6 +167,50 @@ int acc_float_offset(int index, int wmma_layout, int stride) {
 }
 
 void inst_not_implemented(const ptx_instruction *pI);
+void hopper_matrix_unsupported_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  (void)thread;
+  inst_not_implemented(pI);
+}
+
+void ldmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  const operand_info &dst = pI->dst();
+  const operand_info &src = pI->src1();
+  const unsigned matrices = dst.get_vect_nelem();
+  const unsigned warp = core->get_gpu()->is_functional_sim()
+                            ? inst.warp_id_func() : inst.warp_id();
+  const unsigned base = warp * core->get_warp_size();
+  if (inst.active_count() != 32 || !core->get_gpu()->is_functional_sim()) {
+    fprintf(stderr, "%s:%u: ldmatrix requires a full warp in functional mode\n",
+            pI->source_file(), pI->source_line());
+    abort();
+  }
+  addr_t rows[4][8];
+  for (unsigned matrix = 0; matrix < matrices; ++matrix) {
+    for (unsigned row = 0; row < 8; ++row) {
+      ptx_thread_info *provider = core->get_thread_info()[base + matrix * 8 + row];
+      rows[matrix][row] = provider->get_operand_value(src, dst, U32_TYPE, provider, 0).u32;
+      if (rows[matrix][row] % 16) {
+        fprintf(stderr, "%s:%u: ldmatrix shared row address must be 16-byte aligned\n",
+                pI->source_file(), pI->source_line());
+        abort();
+      }
+    }
+  }
+  for (unsigned lane = 0; lane < 32; ++lane) {
+    ptx_thread_info *thread = core->get_thread_info()[base + lane];
+    for (unsigned matrix = 0; matrix < matrices; ++matrix) {
+      ptx_reg_t value;
+      for (unsigned half = 0; half < 2; ++half) {
+        unsigned row = lane / 4, column = (lane % 4) * 2 + half;
+        if (pI->ptx_matrix.transpose) std::swap(row, column);
+        uint16_t element;
+        thread->m_shared_mem->read(rows[matrix][row] + column * 2, 2, &element);
+        value.u32 |= (unsigned)element << (half * 16);
+      }
+      thread->set_reg(dst.vec_symbol(matrix), value);
+    }
+  }
+}
 ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
                               operand_info dstInfo, unsigned type,
                               ptx_thread_info *thread);
@@ -499,12 +543,17 @@ unsigned get_operand_nbits(const operand_info &op) {
       case U16_TYPE:
       case F16_TYPE:
       case B16_TYPE:
+      case BF16_TYPE:
         return 16;
       case S32_TYPE:
       case U32_TYPE:
       case F32_TYPE:
       case B32_TYPE:
+      case TF32_TYPE:
         return 32;
+      case E4M3_TYPE:
+      case E5M2_TYPE:
+        return 8;
       case S64_TYPE:
       case U64_TYPE:
       case F64_TYPE:

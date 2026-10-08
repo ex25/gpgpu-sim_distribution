@@ -248,7 +248,9 @@ class ptx_version {
     m_sm_version_str = sm_ver;
     check_target_extension(ext);
     check_target_extension(ext2);
-    sscanf(sm_ver, "%u", &m_sm_version);
+    const char *digits = sm_ver;
+    if (!strncmp(digits, "sm_", 3)) digits += 3;
+    sscanf(digits, "%u", &m_sm_version);
     m_sm_version_valid = true;
   }
   float ver() const {
@@ -263,6 +265,7 @@ class ptx_version {
     assert(m_valid);
     return m_ptx_extensions;
   }
+  const std::string &target_string() const { return m_sm_version_str; }
 
  private:
   void check_target_extension(const char *ext) {

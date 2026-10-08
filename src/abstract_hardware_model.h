@@ -169,6 +169,17 @@ enum uarch_op_t {
   SPECIALIZED_UNIT_7_OP,
   SPECIALIZED_UNIT_8_OP
 };
+// PTX matrix metadata is kept apart from fixed-size legacy register arrays.
+// Later stages can consume the complete accumulator tuple without truncation.
+struct ptx_matrix_metadata {
+  enum family { NONE, LDMATRIX, MMA_SYNC, WGMMA } kind = NONE;
+  std::string opcode;
+  unsigned m = 0, n = 0, k = 0, matrices = 0;
+  bool transpose = false;
+  bool functional_supported = false;
+  bool timing_supported = false;
+  std::vector<unsigned> accumulator_registers;
+};
 typedef enum uarch_op_t op_type;
 
 enum uarch_bar_t { NOT_BAR = -1, SYNC = 1, ARRIVE, RED };
@@ -1396,6 +1407,7 @@ class inst_t {
   void set_syncs_op(syncs_op syncs_op) { m_syncs_op = syncs_op; }
 
   address_type pc;  // program counter address of instruction
+  ptx_matrix_metadata ptx_matrix;
   unsigned isize;   // size of instruction in bytes
   op_type op;       // opcode (uarch visible)
 

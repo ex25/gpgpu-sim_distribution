@@ -1046,10 +1046,23 @@ unsigned type_info_key::type_decode(int type, size_t &size, int &basic_type) {
       size = 16;
       basic_type = -1;
       return 8;
+    case BF16_TYPE:
+      size = 16;
+      basic_type = -1;
+      return 8;
     case F32_TYPE:
       size = 32;
       basic_type = -1;
       return 9;
+    case TF32_TYPE:
+      size = 32;
+      basic_type = -1;
+      return 9;
+    case E4M3_TYPE:
+    case E5M2_TYPE:
+      size = 8;
+      basic_type = -1;
+      return 8;
     case F64_TYPE:
       size = 64;
       basic_type = -1;

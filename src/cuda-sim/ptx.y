@@ -49,6 +49,7 @@ class ptx_recognizer;
 
 %token <string_value> STRING
 %token <int_value>  OPCODE
+%token <string_value> MATRIX_OPCODE
 %token <int_value>  WMMA_DIRECTIVE
 %token <int_value>  LAYOUT 
 %token <int_value>  CONFIGURATION 
@@ -111,6 +112,10 @@ class ptx_recognizer;
 %token  BB64_TYPE
 %token  BB128_TYPE
 %token  PRED_TYPE
+%token  BF16_TYPE
+%token  TF32_TYPE
+%token  E4M3_TYPE
+%token  E5M2_TYPE
 %token  TEXREF_TYPE
 %token  SAMPLERREF_TYPE
 %token  SURFREF_TYPE
@@ -408,6 +413,10 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| BB64_TYPE   { recognizer->add_scalar_type_spec( BB64_TYPE ); }
 	| BB128_TYPE   { recognizer->add_scalar_type_spec( BB128_TYPE ); }
 	| PRED_TYPE  { recognizer->add_scalar_type_spec( PRED_TYPE ); }
+	| BF16_TYPE  { recognizer->add_scalar_type_spec( BF16_TYPE ); }
+	| TF32_TYPE  { recognizer->add_scalar_type_spec( TF32_TYPE ); }
+	| E4M3_TYPE  { recognizer->add_scalar_type_spec( E4M3_TYPE ); }
+	| E5M2_TYPE  { recognizer->add_scalar_type_spec( E5M2_TYPE ); }
 	| TEXREF_TYPE  { recognizer->add_scalar_type_spec( TEXREF_TYPE ); }
 	| SAMPLERREF_TYPE  { recognizer->add_scalar_type_spec( SAMPLERREF_TYPE ); }
 	| SURFREF_TYPE  { recognizer->add_scalar_type_spec( SURFREF_TYPE ); }
@@ -447,7 +456,8 @@ instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return
 	| opcode_spec
 	;
 
-opcode_spec: OPCODE { recognizer->add_opcode($1); } option_list
+opcode_spec: MATRIX_OPCODE { recognizer->add_matrix_opcode($1); free($1); }
+	| OPCODE { recognizer->add_opcode($1); } option_list
 	| OPCODE { recognizer->add_opcode($1); }
 
 pred_spec: PRED IDENTIFIER  { recognizer->add_pred($2,0, -1); }
@@ -609,11 +619,11 @@ operand: IDENTIFIER  { recognizer->add_scalar_operand( $1 ); }
 	| IDENTIFIER BACKSLASH IDENTIFIER HI_OPTION { recognizer->add_2vector_operand($1,$3); recognizer->change_double_operand_type(-3); recognizer->change_operand_lohi(2);}
 	;
 
-vector_operand: LEFT_BRACE IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_2vector_operand($2,$4); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_3vector_operand($2,$4,$6); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_4vector_operand($2,$4,$6,$8); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_8vector_operand($2,$4,$6,$8,$10,$12,$14,$16); }
-		| LEFT_BRACE IDENTIFIER RIGHT_BRACE { recognizer->add_1vector_operand($2); }
+vector_operand: LEFT_BRACE IDENTIFIER { recognizer->begin_vector_operand($2); } vector_operand_tail RIGHT_BRACE { recognizer->finish_vector_operand(); }
+	;
+
+vector_operand_tail: /* empty */
+	| COMMA IDENTIFIER { recognizer->append_vector_operand($2); } vector_operand_tail
 	;
 
 tex_operand: LEFT_SQUARE_BRACKET IDENTIFIER COMMA { recognizer->add_scalar_operand($2); }
