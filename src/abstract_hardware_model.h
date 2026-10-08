@@ -180,6 +180,27 @@ struct ptx_matrix_metadata {
   bool timing_supported = false;
   std::vector<unsigned> accumulator_registers;
 };
+
+enum class ptx_mbarrier_op {
+  NONE,
+  INIT,
+  INVALIDATE,
+  EXPECT_TX,
+  COMPLETE_TX,
+  ARRIVE,
+  ARRIVE_DROP,
+  TEST_WAIT,
+  TRY_WAIT,
+  PENDING_COUNT
+};
+
+struct ptx_mbarrier_metadata {
+  ptx_mbarrier_op kind = ptx_mbarrier_op::NONE;
+  std::string opcode;
+  bool parity = false;
+  bool functional_supported = false;
+  bool timing_supported = false;
+};
 typedef enum uarch_op_t op_type;
 
 enum uarch_bar_t { NOT_BAR = -1, SYNC = 1, ARRIVE, RED };
@@ -287,6 +308,7 @@ typedef struct {
     } wait;
   } u;
   bool init_as_one[MAX_WARP_SIZE] = {false};
+  bool wait_parity[MAX_WARP_SIZE] = {false};
 } syncs_operand;
 
 /**
@@ -347,22 +369,43 @@ class mbarrier_t {
         tx_count(0),
         phase(0) {}
 
+  explicit mbarrier_t(uint32_t bar_addr, uint32_t count)
+      : cluster_cta_identifier(),
+        cuda_cta_id(dim3(0, 0, 0)),
+        bar_addr(bar_addr),
+        pending_thread_count(count),
+        expected_arrival_thread_count(count),
+        tx_count(0),
+        phase(0) {}
+
   // Different operations you can perform on a mbarrier
   // Check
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier
   // for more details
   void arrive_on(uint32_t count) {
+    assert(count <= this->pending_thread_count &&
+           "mbarrier arrive count exceeds pending arrivals");
     this->pending_thread_count -= count;
     try_phase_transition();
   }
 
-  void drop_on(uint32_t count) { this->expected_arrival_thread_count -= count; }
+  void drop_on(uint32_t count) {
+    assert(count <= this->expected_arrival_thread_count &&
+           "mbarrier arrive_drop count exceeds expected arrivals");
+    this->expected_arrival_thread_count -= count;
+  }
 
-  void expect_on(uint32_t txCount) { this->tx_count += txCount; }
+  void expect_on(uint32_t txCount) {
+    assert(txCount <= INT32_MAX - this->tx_count &&
+           "mbarrier transaction count overflow");
+    this->tx_count += txCount;
+  }
 
   void complete_on(uint32_t txCount) {
     // complete-on op triggers phase transition
     // but it will not return phase
+    assert(txCount <= static_cast<uint32_t>(this->tx_count) &&
+           "mbarrier complete_tx exceeds transaction count");
     this->tx_count -= txCount;
     try_phase_transition();
   }
@@ -390,6 +433,12 @@ class mbarrier_t {
   int32_t get_tx_count() const { return tx_count; }
   int get_phase() const { return phase; }
   void inc_phase() { phase++; }
+
+  bool test_wait(uint32_t prior_phase, bool parity) const {
+    return parity ? ((static_cast<uint32_t>(phase) & 1u) !=
+                     (prior_phase & 1u))
+                  : static_cast<uint32_t>(phase) > prior_phase;
+  }
 
  private:
   // Cluster CTA identifier
@@ -1408,6 +1457,7 @@ class inst_t {
 
   address_type pc;  // program counter address of instruction
   ptx_matrix_metadata ptx_matrix;
+  ptx_mbarrier_metadata ptx_mbarrier;
   unsigned isize;   // size of instruction in bytes
   op_type op;       // opcode (uarch visible)
 

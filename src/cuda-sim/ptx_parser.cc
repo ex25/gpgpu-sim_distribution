@@ -98,6 +98,7 @@ void ptx_recognizer::init_instruction_state() {
   g_wmma_options.clear();
   g_vector_operands.clear();
   g_matrix_opcode.clear();
+  g_mbarrier_opcode.clear();
   g_return_var = operand_info(gpgpu_ctx);
   init_directive_state();
 }
@@ -269,6 +270,7 @@ const ptx_instruction *ptx_recognizer::ptx_instruction_lookup(
 
 void ptx_recognizer::add_instruction() {
   validate_matrix_operands();
+  validate_mbarrier_operands();
   PTX_PARSE_DPRINTF("add_instruction: %s",
                     ((g_opcode > 0) ? g_opcode_string[g_opcode] : "<label>"));
   assert(g_shader_core_config != 0);
@@ -299,6 +301,53 @@ void ptx_recognizer::add_instruction() {
       const operand_info &dst = g_operands.front();
       for (unsigned r = 0; r < dst.get_vect_nelem(); ++r)
         i->ptx_matrix.accumulator_registers.push_back(dst.vec_symbol(r)->reg_num());
+    }
+  }
+  if (!g_mbarrier_opcode.empty()) {
+    i->ptx_mbarrier.opcode = g_mbarrier_opcode;
+    i->ptx_mbarrier.functional_supported = true;
+    i->ptx_mbarrier.timing_supported = false;
+    if (g_mbarrier_opcode.find(".init.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::INIT;
+    else if (g_mbarrier_opcode.find(".inval.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::INVALIDATE;
+    else if (g_mbarrier_opcode.find(".arrive_drop.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::ARRIVE_DROP;
+    else if (g_mbarrier_opcode.find(".arrive.expect_tx.") != std::string::npos ||
+             g_mbarrier_opcode.find(".arrive.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::ARRIVE;
+    else if (g_mbarrier_opcode.find(".expect_tx.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::EXPECT_TX;
+    else if (g_mbarrier_opcode.find(".complete_tx.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::COMPLETE_TX;
+    else if (g_mbarrier_opcode.find(".test_wait.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::TEST_WAIT;
+    else if (g_mbarrier_opcode.find(".try_wait.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::TRY_WAIT;
+    else if (g_mbarrier_opcode.find(".pending_count.") != std::string::npos)
+      i->ptx_mbarrier.kind = ptx_mbarrier_op::PENDING_COUNT;
+    i->ptx_mbarrier.parity = g_mbarrier_opcode.find(".parity.") != std::string::npos;
+    switch (i->ptx_mbarrier.kind) {
+      case ptx_mbarrier_op::INIT:
+        i->set_syncs_op(SYNCS_INIT); break;
+      case ptx_mbarrier_op::INVALIDATE:
+        i->set_syncs_op(SYNCS_INVALIDATE); break;
+      case ptx_mbarrier_op::EXPECT_TX:
+        i->set_syncs_op(SYNCS_EXPECT_TX); break;
+      case ptx_mbarrier_op::COMPLETE_TX:
+        i->set_syncs_op(SYNCS_COMPELTE_TX); break;
+      case ptx_mbarrier_op::ARRIVE:
+        i->set_syncs_op(g_mbarrier_opcode.find(".expect_tx.") != std::string::npos
+                            ? SYNCS_ARRIVE_EXPECT_TX : SYNCS_ARRIVE); break;
+      case ptx_mbarrier_op::ARRIVE_DROP:
+        i->set_syncs_op(SYNCS_ARRIVE_DROP); break;
+      case ptx_mbarrier_op::TEST_WAIT:
+        i->set_syncs_op(SYNCS_TEST_WAIT); break;
+      case ptx_mbarrier_op::TRY_WAIT:
+        i->set_syncs_op(SYNCS_TRY_WAIT); break;
+      case ptx_mbarrier_op::PENDING_COUNT:
+        i->set_syncs_op(SYNCS_PENDING_COUNT); break;
+      default: break;
     }
   }
   g_instructions.push_back(i);
@@ -752,6 +801,43 @@ void ptx_recognizer::add_matrix_opcode(const char *opcode) {
   }
 }
 
+void ptx_recognizer::add_mbarrier_opcode(const char *opcode) {
+  std::string text(opcode);
+  const auto has = [&](const char *part) {
+    return text.find(part) != std::string::npos;
+  };
+  ptx_mbarrier_op kind = ptx_mbarrier_op::NONE;
+  if (has(".init.")) kind = ptx_mbarrier_op::INIT;
+  else if (has(".inval.")) kind = ptx_mbarrier_op::INVALIDATE;
+  else if (has(".arrive_drop.")) kind = ptx_mbarrier_op::ARRIVE_DROP;
+  else if (has(".arrive.expect_tx.") || has(".arrive.")) kind = ptx_mbarrier_op::ARRIVE;
+  else if (has(".expect_tx.")) kind = ptx_mbarrier_op::EXPECT_TX;
+  else if (has(".complete_tx.")) kind = ptx_mbarrier_op::COMPLETE_TX;
+  else if (has(".test_wait.")) kind = ptx_mbarrier_op::TEST_WAIT;
+  else if (has(".try_wait.")) kind = ptx_mbarrier_op::TRY_WAIT;
+  else if (has(".pending_count.")) kind = ptx_mbarrier_op::PENDING_COUNT;
+  parse_assert(kind != ptx_mbarrier_op::NONE,
+               "unsupported mbarrier opcode/modifier: %s", opcode);
+  parse_assert(text.find(".b64") != std::string::npos,
+               "mbarrier requires .b64: %s", opcode);
+  parse_assert(text.find(".shared") != std::string::npos,
+               "mbarrier requires shared address space: %s", opcode);
+  if (has("::cluster"))
+    parse_assert(kind == ptx_mbarrier_op::ARRIVE ||
+                     kind == ptx_mbarrier_op::ARRIVE_DROP ||
+                     kind == ptx_mbarrier_op::EXPECT_TX ||
+                     kind == ptx_mbarrier_op::COMPLETE_TX,
+                 "cluster mbarrier wait is unsupported: %s", opcode);
+  g_opcode = MBARRIER_OP;
+  g_mbarrier_opcode = text;
+  g_matrix_opcode.clear();
+  g_options.clear();
+  g_wmma_options.clear();
+  g_scalar_type.clear();
+  g_scalar_type.push_back(B64_TYPE);
+  g_space_spec = shared_space;
+}
+
 void ptx_recognizer::validate_matrix_operands() {
   if (g_matrix_opcode.empty()) return;
   std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
@@ -804,6 +890,57 @@ void ptx_recognizer::validate_matrix_operands() {
     parse_assert(count >= 0 && count <= 7, "wgmma.wait_group immediate must be 0..7");
   } else {
     parse_assert(ops.empty(), "wgmma fence/commit take no operands");
+  }
+}
+
+void ptx_recognizer::validate_mbarrier_operands() {
+  if (g_mbarrier_opcode.empty()) return;
+  std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+  const auto address = [&](unsigned pos) {
+    parse_assert(pos < ops.size() && ops[pos].is_memory_operand(),
+                 "mbarrier requires a shared address operand");
+    parse_assert(ops[pos].get_symbol() && ops[pos].get_symbol()->type(),
+                 "mbarrier address has no symbol");
+  };
+  const auto value = [&](unsigned pos) {
+    parse_assert(pos < ops.size() &&
+                     (ops[pos].is_reg() || ops[pos].is_literal()),
+                 "mbarrier count requires a register or immediate");
+  };
+  const bool returns_state = g_mbarrier_opcode.find(".cluster") == std::string::npos;
+  const bool parity = g_mbarrier_opcode.find(".parity.") != std::string::npos;
+  if (g_mbarrier_opcode.find(".init.") != std::string::npos) {
+    parse_assert(ops.size() == 2, "mbarrier.init requires address and count");
+    address(0); value(1);
+  } else if (g_mbarrier_opcode.find(".inval.") != std::string::npos) {
+    parse_assert(ops.size() == 1, "mbarrier.inval requires one address"); address(0);
+  } else if (g_mbarrier_opcode.find(".arrive_drop.") != std::string::npos ||
+             g_mbarrier_opcode.find(".arrive.") != std::string::npos) {
+    const bool expect = g_mbarrier_opcode.find(".arrive.expect_tx.") != std::string::npos;
+    parse_assert(ops.size() == (expect ? 3 : 2),
+                 "mbarrier arrive operand count mismatch");
+    if (returns_state)
+      parse_assert(ops[0].is_reg() || ops[0].is_non_arch_reg(),
+                   "mbarrier arrive state must be a .b64 register or sink");
+    address(returns_state ? 1 : 0);
+    if (expect) value(2);
+  } else if (g_mbarrier_opcode.find(".expect_tx.") != std::string::npos ||
+             g_mbarrier_opcode.find(".complete_tx.") != std::string::npos) {
+    parse_assert(ops.size() == 2, "mbarrier transaction operation requires address and count");
+    address(0); value(1);
+  } else if (g_mbarrier_opcode.find(".test_wait.") != std::string::npos ||
+             g_mbarrier_opcode.find(".try_wait.") != std::string::npos) {
+    parse_assert(ops.size() == 3 || ops.size() == 4,
+                 "mbarrier wait requires predicate, address, and state");
+    parse_assert(ops[0].is_reg(), "mbarrier wait result must be a predicate register");
+    address(1); value(2);
+    if (parity) parse_assert(ops[2].is_literal() || ops[2].is_reg(),
+                             "mbarrier parity requires a 32-bit value");
+    if (ops.size() == 4) value(3);
+  } else if (g_mbarrier_opcode.find(".pending_count.") != std::string::npos) {
+    parse_assert(ops.size() == 2, "mbarrier.pending_count requires result and address");
+    parse_assert(ops[0].is_reg(), "mbarrier.pending_count result must be a register");
+    address(1);
   }
 }
 

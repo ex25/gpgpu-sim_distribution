@@ -578,7 +578,8 @@ void ptx_instruction::set_fp_or_int_archop() {
   oprnd_type = UN_OP;
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
-      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP) return;
+      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
+      m_opcode == MBARRIER_OP) return;
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
@@ -605,7 +606,8 @@ void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
-      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP) return;
+      m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
+      m_opcode == MBARRIER_OP) return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
       (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
@@ -1037,6 +1039,9 @@ void ptx_instruction::set_opcode_and_latency() {
       // These carry frontend metadata only; timing fetch fails explicitly.
       op = NO_OP;
       break;
+    case MBARRIER_OP:
+      op = SYNCS_OP;
+      break;
     default:
       break;
   }
@@ -1187,7 +1192,8 @@ void ptx_instruction::pre_decode() {
     const operand_info &o = *opr;
     if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
         m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
-        m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP)
+        m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
+        m_opcode == MBARRIER_OP)
       continue;
     if (has_dst && n == 0) {
       // Do not set the null register "_" as an architectural register

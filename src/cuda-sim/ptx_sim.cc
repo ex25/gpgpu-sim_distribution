@@ -135,6 +135,67 @@ void ptx_cta_info::inc_bar_threads() { m_bar_threads++; }
 
 void ptx_cta_info::reset_bar_threads() { m_bar_threads = 0; }
 
+void ptx_cta_info::mbarrier_init(addr_t bar_addr, uint32_t count) {
+  assert(bar_addr % 8 == 0 && count > 0);
+  auto inserted = m_mbarriers.emplace(bar_addr, mbarrier_t(bar_addr, count));
+  assert(inserted.second && "mbarrier.init reused an initialized object");
+}
+
+void ptx_cta_info::mbarrier_invalidate(addr_t bar_addr) {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.inval on unknown object");
+  assert(it->second.get_pending_thread_count() == 0 &&
+         it->second.get_tx_count() == 0 &&
+         "mbarrier.inval before phase completion");
+  m_mbarriers.erase(it);
+}
+
+uint32_t ptx_cta_info::mbarrier_arrive(addr_t bar_addr, uint32_t count,
+                                       uint32_t tx_count) {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.arrive on unknown object");
+  uint32_t phase = it->second.get_phase();
+  if (tx_count) it->second.expect_on(tx_count);
+  it->second.arrive_on(count);
+  return phase;
+}
+
+uint32_t ptx_cta_info::mbarrier_arrive_drop(addr_t bar_addr, uint32_t count,
+                                            uint32_t tx_count) {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.arrive_drop on unknown object");
+  uint32_t phase = it->second.get_phase();
+  if (tx_count) it->second.expect_on(tx_count);
+  it->second.drop_on(count);
+  it->second.arrive_on(count);
+  return phase;
+}
+
+void ptx_cta_info::mbarrier_expect_tx(addr_t bar_addr, uint32_t tx_count) {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.expect_tx on unknown object");
+  it->second.expect_on(tx_count);
+}
+
+void ptx_cta_info::mbarrier_complete_tx(addr_t bar_addr, uint32_t tx_count) {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.complete_tx on unknown object");
+  it->second.complete_on(tx_count);
+}
+
+uint32_t ptx_cta_info::mbarrier_pending_count(addr_t bar_addr) const {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier.pending_count on unknown object");
+  return it->second.get_pending_thread_count();
+}
+
+bool ptx_cta_info::mbarrier_test_wait(addr_t bar_addr, uint32_t phase,
+                                      bool parity) const {
+  auto it = m_mbarriers.find(bar_addr);
+  assert(it != m_mbarriers.end() && "mbarrier wait on unknown object");
+  return it->second.test_wait(phase, parity);
+}
+
 ptx_warp_info::ptx_warp_info() { reset_done_threads(); }
 
 unsigned ptx_warp_info::get_done_threads() const { return m_done_threads; }

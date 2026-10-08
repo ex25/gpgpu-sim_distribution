@@ -167,6 +167,16 @@ class ptx_cta_info {
   unsigned get_bar_threads() const;
   void inc_bar_threads();
   void reset_bar_threads();
+  void mbarrier_init(addr_t bar_addr, uint32_t count);
+  void mbarrier_invalidate(addr_t bar_addr);
+  uint32_t mbarrier_arrive(addr_t bar_addr, uint32_t count,
+                           uint32_t tx_count);
+  uint32_t mbarrier_arrive_drop(addr_t bar_addr, uint32_t count,
+                                uint32_t tx_count);
+  void mbarrier_expect_tx(addr_t bar_addr, uint32_t tx_count);
+  void mbarrier_complete_tx(addr_t bar_addr, uint32_t tx_count);
+  uint32_t mbarrier_pending_count(addr_t bar_addr) const;
+  bool mbarrier_test_wait(addr_t bar_addr, uint32_t phase, bool parity) const;
 
  private:
   // backward pointer
@@ -177,6 +187,7 @@ class ptx_cta_info {
   std::set<ptx_thread_info *> m_threads_in_cta;
   std::set<ptx_thread_info *> m_threads_that_have_exited;
   std::set<ptx_thread_info *> m_dangling_pointers;
+  std::map<addr_t, mbarrier_t> m_mbarriers;
 };
 
 class ptx_warp_info {

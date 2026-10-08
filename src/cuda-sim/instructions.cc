@@ -172,6 +172,80 @@ void hopper_matrix_unsupported_impl(const ptx_instruction *pI, ptx_thread_info *
   inst_not_implemented(pI);
 }
 
+void mbarrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const ptx_mbarrier_op kind = pI->ptx_mbarrier.kind;
+  const bool cluster = pI->ptx_mbarrier.opcode.find(".cluster") !=
+                       std::string::npos;
+  const operand_info &address_operand =
+      (kind == ptx_mbarrier_op::INIT || kind == ptx_mbarrier_op::EXPECT_TX ||
+       kind == ptx_mbarrier_op::COMPLETE_TX ||
+       kind == ptx_mbarrier_op::INVALIDATE ||
+       ((kind == ptx_mbarrier_op::ARRIVE ||
+         kind == ptx_mbarrier_op::ARRIVE_DROP) && cluster))
+          ? pI->dst()
+          : pI->src1();
+  const addr_t bar_addr =
+      thread->get_operand_value(address_operand, address_operand, B64_TYPE,
+                                thread, 0)
+          .u64;
+  const auto value = [&](unsigned index) {
+    return thread->get_operand_value(pI->operand_lookup(index), pI->dst(),
+                                     U32_TYPE, thread, 0)
+        .u32;
+  };
+  ptx_reg_t result;
+  switch (kind) {
+    case ptx_mbarrier_op::INIT:
+      thread->m_cta_info->mbarrier_init(bar_addr, value(1));
+      return;
+    case ptx_mbarrier_op::INVALIDATE:
+      thread->m_cta_info->mbarrier_invalidate(bar_addr);
+      return;
+    case ptx_mbarrier_op::EXPECT_TX:
+      thread->m_cta_info->mbarrier_expect_tx(bar_addr, value(1));
+      return;
+    case ptx_mbarrier_op::COMPLETE_TX:
+      thread->m_cta_info->mbarrier_complete_tx(bar_addr, value(1));
+      return;
+    case ptx_mbarrier_op::ARRIVE:
+    case ptx_mbarrier_op::ARRIVE_DROP: {
+      const bool expect = pI->ptx_mbarrier.opcode.find(".expect_tx.") !=
+                          std::string::npos;
+      const uint32_t count = expect || pI->ptx_mbarrier.opcode.find(".cluster") !=
+                                     std::string::npos
+                                 ? 1
+                                 : (pI->get_num_operands() > 2 ? value(2) : 1);
+      const uint32_t tx_count = expect ? value(2) : 0;
+      const uint32_t phase =
+          kind == ptx_mbarrier_op::ARRIVE
+              ? thread->m_cta_info->mbarrier_arrive(bar_addr, count, tx_count)
+              : thread->m_cta_info->mbarrier_arrive_drop(bar_addr, count,
+                                                         tx_count);
+      if (pI->dst().is_reg()) {
+        result.u64 = phase;
+        thread->set_operand_value(pI->dst(), result, B64_TYPE, thread, pI);
+      }
+      return;
+    }
+    case ptx_mbarrier_op::TEST_WAIT:
+    case ptx_mbarrier_op::TRY_WAIT: {
+      const bool complete = thread->m_cta_info->mbarrier_test_wait(
+          bar_addr, value(2), pI->ptx_mbarrier.parity);
+      result.pred = complete ? 1 : 0;
+      thread->set_operand_value(pI->dst(), result, PRED_TYPE, thread, pI);
+      return;
+    }
+    case ptx_mbarrier_op::PENDING_COUNT:
+      result.u32 = thread->m_cta_info->mbarrier_pending_count(bar_addr);
+      thread->set_operand_value(pI->dst(), result, U32_TYPE, thread, pI);
+      return;
+    default:
+      fprintf(stderr, "%s:%u: unsupported mbarrier operation\n",
+              pI->source_file(), pI->source_line());
+      abort();
+  }
+}
+
 void ldmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   const operand_info &dst = pI->dst();
   const operand_info &src = pI->src1();

@@ -85,6 +85,7 @@ class ptx_recognizer {
   std::list<int> g_scalar_type;
   std::vector<std::string> g_vector_operands;
   std::string g_matrix_opcode;
+  std::string g_mbarrier_opcode;
   // type specifier stuff:
   memory_space_t g_space_spec;
   memory_space_t g_ptr_spec;
@@ -129,7 +130,9 @@ class ptx_recognizer {
   void set_variable_type();
   void add_opcode(int opcode);
   void add_matrix_opcode(const char *opcode);
+  void add_mbarrier_opcode(const char *opcode);
   void validate_matrix_operands();
+  void validate_mbarrier_operands();
   void begin_vector_operand(const char *identifier);
   void append_vector_operand(const char *identifier);
   void finish_vector_operand();
