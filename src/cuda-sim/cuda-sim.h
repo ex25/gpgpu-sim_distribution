@@ -77,6 +77,8 @@ class functionalCoreSim : public core_t {
   }
   //! executes all warps till completion
   void execute(int inst_count, unsigned ctaid_cp);
+  void initializeCTA(unsigned ctaid_cp);
+  bool cluster_step();
   virtual void warp_exit(unsigned warp_id);
   virtual bool warp_waiting_at_barrier(unsigned warp_id) const {
     return (m_warpAtBarrier[warp_id] || !(m_liveThreadCount[warp_id] > 0));
@@ -85,7 +87,6 @@ class functionalCoreSim : public core_t {
  private:
   void executeWarp(unsigned, bool &, bool &);
   // initializes threads in the CTA block which we are executing
-  void initializeCTA(unsigned ctaid_cp);
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
                                              unsigned tid) {
     if (m_thread[tid] == NULL || m_thread[tid]->is_done()) {

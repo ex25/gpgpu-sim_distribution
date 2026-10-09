@@ -579,7 +579,8 @@ void ptx_instruction::set_fp_or_int_archop() {
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
       m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
-      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP) return;
+      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP ||
+      m_opcode == CLUSTER_BARRIER_OP) return;
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
@@ -607,7 +608,8 @@ void ptx_instruction::set_mul_div_or_other_archop() {
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
       m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
-      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP) return;
+      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP ||
+      m_opcode == CLUSTER_BARRIER_OP) return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
       (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
@@ -1916,6 +1918,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
         pI = pJ;
       }
 
+      if (inst_opcode == CLUSTER_BARRIER_OP && inst.active_count() != MAX_WARP_SIZE)
+        throw std::runtime_error("aligned cluster barrier requires a full active warp");
       if (pI->ptx_matrix.kind == ptx_matrix_metadata::WGMMA &&
           inst.active_count() != MAX_WARP_SIZE)
         throw std::runtime_error(get_location() + ": incomplete WGMMA active warp");
@@ -2179,6 +2183,10 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       }
     }
 
+  } catch (const std::runtime_error &error) {
+    const std::string message(error.what());
+    if (message.find(get_location()) == 0) throw;
+    throw std::runtime_error(get_location() + ": " + message);
   } catch (int x) {
     printf("GPGPU-Sim PTX: ERROR (%d) executing intruction (%s:%u)\n", x,
            pI->source_file(), pI->source_line());
@@ -2274,7 +2282,7 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
 
   // unsigned sm_idx = (tid/cta_size)*gpgpu_param_num_shaders + sid;
   unsigned sm_idx =
-      hw_cta_id * gpu->gpgpu_ctx->func_sim->gpgpu_param_num_shaders + sid;
+      hw_cta_id * std::max(1u, gpu->gpgpu_ctx->func_sim->gpgpu_param_num_shaders) + sid;
 
   if (shared_memory_lookup.find(sm_idx) == shared_memory_lookup.end()) {
     if (g_debug_execution >= 1) {
@@ -2302,7 +2310,10 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
   }
 
   std::map<unsigned, memory_space *> &local_mem_lookup =
-      local_memory_lookup[sid];
+      local_memory_lookup[isInFunctionalSimulationMode &&
+          gpu->get_ptx_cluster_dim(kernel.get_uid()).x *
+          gpu->get_ptx_cluster_dim(kernel.get_uid()).y *
+          gpu->get_ptx_cluster_dim(kernel.get_uid()).z > 1 ? sm_idx : sid];
   while (kernel.more_threads_in_cta()) {
     dim3 ctaid3d = kernel.get_next_cta_id();
     unsigned new_tid = kernel.get_next_thread_id();
@@ -2334,11 +2345,28 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     thd->set_nctaid(kernel.get_grid_dim());
     thd->set_ntid(kernel.get_cta_dim());
     thd->set_ctaid(ctaid3d);
+    const dim3 cluster_dim = gpu->get_ptx_cluster_dim(kernel.get_uid());
+    const dim3 grid = kernel.get_grid_dim();
+    if (grid.x % cluster_dim.x || grid.y % cluster_dim.y || grid.z % cluster_dim.z)
+      throw std::runtime_error("PTX grid dimensions must be divisible by cluster dimensions");
+    const dim3 cluster_id(ctaid3d.x / cluster_dim.x, ctaid3d.y / cluster_dim.y,
+                          ctaid3d.z / cluster_dim.z);
+    const unsigned rank = ctaid3d.x % cluster_dim.x + cluster_dim.x *
+        (ctaid3d.y % cluster_dim.y + cluster_dim.y * (ctaid3d.z % cluster_dim.z));
+    thd->set_cluster_dim(cluster_dim);
+    thd->set_cluster_id(cluster_id);
+    thd->set_cluster_rank(rank);
+    thd->set_cluster_nctarank(cluster_dim.x * cluster_dim.y * cluster_dim.z);
+    thd->set_explicit_cluster(gpu->has_ptx_cluster_launch(kernel.get_uid()));
+    if (cluster_dim.x * cluster_dim.y * cluster_dim.z > 1 &&
+        tid3d.x == 0 && tid3d.y == 0 && tid3d.z == 0)
+      gpu->ptx_cluster_start_cta(kernel.get_uid(), cluster_id, rank, kernel.threads_per_cta());
     thd->set_tid(tid3d);
     if (kernel.entry()->get_ptx_version().extensions())
       thd->cpy_tid_to_reg(tid3d);
     thd->set_valid();
-    thd->m_shared_mem = shared_mem;
+    thd->m_shared_mem = cluster_dim.x * cluster_dim.y * cluster_dim.z > 1 ?
+        gpu->get_or_create_ptx_cluster_shared(kernel.get_uid(), cluster_id, rank) : shared_mem;
     thd->m_sstarr_mem = sstarr_mem;
     function_info *finfo = thd->func_info();
     symbol_table *st = finfo->get_symtab();
@@ -2679,9 +2707,34 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
   cp_cta_resume = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_CTA_t;
   int cta_launched = 0;
 
-  // we excute the kernel one CTA (Block) at the time, as synchronization
-  // functions work block wise
-  while (!kernel.no_more_ctas_to_run()) {
+  const dim3 cluster_dim = gpgpu_ctx->the_gpgpusim->g_the_gpu->get_ptx_cluster_dim(kernel.get_uid());
+  const bool clustered = cluster_dim.x * cluster_dim.y * cluster_dim.z > 1;
+  if (clustered && cp_op)
+    throw std::runtime_error("PTX functional cluster checkpoint/resume is not implemented");
+  // Cluster CTAs must be live together: a blocking wait cannot be implemented
+  // by the legacy one-CTA-at-a-time functional driver.
+  if (clustered) {
+    std::vector<std::unique_ptr<functionalCoreSim>> cores;
+    while (!kernel.no_more_ctas_to_run()) {
+      unsigned slot = kernel.get_next_cta_id_single();
+      cores.emplace_back(new functionalCoreSim(&kernel,
+          gpgpu_ctx->the_gpgpusim->g_the_gpu,
+          gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size));
+      cores.back()->initializeCTA(slot);
+    }
+    unsigned stagnant = 0;
+    while (true) {
+      unsigned before = g_ptx_sim_num_insn;
+      bool live = false;
+      for (auto &core : cores) live |= core->cluster_step();
+      if (!live) break;
+      if (g_ptx_sim_num_insn == before) {
+        if (++stagnant > 1)
+          throw std::runtime_error("PTX functional cluster deadlock: missing arrival or divergent wait");
+      } else stagnant = 0;
+    }
+  }
+  while (!clustered && !kernel.no_more_ctas_to_run()) {
     unsigned temp = kernel.get_next_cta_id_single();
 
     if (cp_op == 0 ||
@@ -2770,7 +2823,11 @@ void functionalCoreSim::initializeCTA(unsigned ctaid_cp) {
   for (unsigned i = 0; i < m_kernel->threads_per_cta(); i++) {
     ptx_sim_init_thread(*m_kernel, &m_thread[i], 0, i,
                         m_kernel->threads_per_cta() - i,
-                        m_kernel->threads_per_cta(), this, 0, i / m_warp_size,
+                        m_kernel->threads_per_cta(), this,
+                        m_gpu->get_ptx_cluster_dim(m_kernel->get_uid()).x *
+                        m_gpu->get_ptx_cluster_dim(m_kernel->get_uid()).y *
+                        m_gpu->get_ptx_cluster_dim(m_kernel->get_uid()).z > 1 ? ctaid_cp : 0,
+                        i / m_warp_size,
                         (gpgpu_t *)m_gpu, true);
     assert(m_thread[i] != NULL && !m_thread[i]->is_done());
     char fname[2048];
@@ -2889,10 +2946,22 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
   }
 }
 
+bool functionalCoreSim::cluster_step() {
+  bool live = false, all_at_barrier = true;
+  for (unsigned i = 0; i < m_warp_count; ++i)
+    executeWarp(i, all_at_barrier, live);
+  if (all_at_barrier)
+    for (unsigned i = 0; i < m_warp_count; ++i) m_warpAtBarrier[i] = false;
+  if (!live && m_thread[0]->m_cta_info->tma_has_pending())
+    throw std::runtime_error("PTX functional cluster CTA exited with pending TMA transfers");
+  return live;
+}
+
 void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
                                     bool &someOneLive) {
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0 &&
-      !m_thread[i * m_warp_size]->wgmma_waiting()) {
+      !m_thread[i * m_warp_size]->wgmma_waiting() &&
+      !m_thread[i * m_warp_size]->cluster_waiting()) {
     warp_inst_t inst = getExecuteWarp(i);
     execute_warp_inst_t(inst, i);
     if (inst.isatomic()) inst.do_atomic(true);

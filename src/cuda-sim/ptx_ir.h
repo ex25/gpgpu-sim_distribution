@@ -1117,6 +1117,8 @@ class ptx_instruction : public warp_inst_t {
   enum vote_mode_t { vote_any, vote_all, vote_uni, vote_ballot };
   enum vote_mode_t vote_mode() const { return m_vote_mode; }
 
+  std::string ptx_cluster_opcode;
+
   int membar_level() const { return m_membar_level; }
 
   bool has_memory_read() const {

@@ -175,6 +175,9 @@ void ptx_cta_info::check_cta_thread_status_and_reset() {
 }
 
 void ptx_cta_info::register_thread_exit(ptx_thread_info *thd) {
+  if (thd->get_cluster_nctarank() > 1)
+    thd->get_gpu()->ptx_cluster_exit_thread(thd->get_kernel().get_uid(),
+        thd->get_cluster_id(), thd->get_cluster_rank());
   for (const auto &pending : m_wgmma_collectives)
     if (pending.first == (thd->get_tid().x + thd->get_ntid().x *
         (thd->get_tid().y + thd->get_ntid().y * thd->get_tid().z)) / 128)
@@ -278,6 +281,11 @@ ptx_thread_info::ptx_thread_info(kernel_info_t &kernel) : m_kernel(kernel) {
   m_at_barrier = false;
   m_valid = false;
   m_gridid = 0;
+  m_cluster_id = dim3(0, 0, 0);
+  m_cluster_dim = dim3(1, 1, 1);
+  m_cluster_rank = 0;
+  m_cluster_nctarank = 1;
+  m_is_explicit_cluster = false;
   m_thread_done = false;
   m_cycle_done = 0;
   m_PC = 0;
@@ -398,6 +406,24 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       if (dim_mod == 2) return m_nctaid.z;
       abort();
       break;
+    case CLUSTERID_REG:
+      assert(dim_mod < 3);
+      return dim_mod == 0 ? m_cluster_id.x : dim_mod == 1 ? m_cluster_id.y : m_cluster_id.z;
+    case NCLUSTERID_REG:
+      assert(dim_mod < 3);
+      return dim_mod == 0 ? m_nctaid.x / m_cluster_dim.x : dim_mod == 1 ? m_nctaid.y / m_cluster_dim.y : m_nctaid.z / m_cluster_dim.z;
+    case CLUSTER_CTAID_REG:
+      assert(dim_mod < 3);
+      return dim_mod == 0 ? m_ctaid.x % m_cluster_dim.x : dim_mod == 1 ? m_ctaid.y % m_cluster_dim.y : m_ctaid.z % m_cluster_dim.z;
+    case CLUSTER_NCTAID_REG:
+      assert(dim_mod < 3);
+      return dim_mod == 0 ? m_cluster_dim.x : dim_mod == 1 ? m_cluster_dim.y : m_cluster_dim.z;
+    case CLUSTER_CTARANK_REG:
+      return m_cluster_rank;
+    case CLUSTER_NCTARANK_REG:
+      return m_cluster_nctarank;
+    case IS_EXPLICIT_CLUSTER_REG:
+      return m_is_explicit_cluster ? 1 : 0;
     case NTID_REG:
       assert(dim_mod < 3);
       if (dim_mod == 0) return m_ntid.x;

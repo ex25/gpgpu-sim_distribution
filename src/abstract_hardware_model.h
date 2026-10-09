@@ -993,6 +993,20 @@ class gpgpu_t {
   void memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count);
 
   class memory_space *get_global_memory() { return m_global_mem; }
+  void register_ptx_cluster_launch(uint64_t kernel, dim3 dimensions);
+  dim3 get_ptx_cluster_dim(uint64_t kernel) const;
+  bool has_ptx_cluster_launch(uint64_t kernel) const { return ptx_cluster_launches.count(kernel); }
+  class memory_space *get_or_create_ptx_cluster_shared(uint64_t kernel,
+                                                        dim3 cluster,
+                                                        unsigned rank);
+  void ptx_cluster_start_cta(uint64_t kernel, dim3 cluster, unsigned rank, unsigned threads);
+  void ptx_cluster_exit_thread(uint64_t kernel, dim3 cluster, unsigned rank);
+  class memory_space *get_ptx_cluster_shared(uint64_t kernel, dim3 cluster, unsigned rank);
+  void ptx_cluster_arrive(uint64_t kernel, dim3 cluster, unsigned thread,
+                          unsigned expected);
+  void ptx_cluster_wait(uint64_t kernel, dim3 cluster, unsigned thread, unsigned expected);
+  bool ptx_cluster_ready(uint64_t kernel, dim3 cluster, unsigned generation) const;
+  unsigned ptx_cluster_generation(uint64_t kernel, dim3 cluster) const;
   void register_ptx_tma_descriptor(uint64_t address, const ptx_tma_descriptor &descriptor) {
     ptx_tma_descriptors[address] = descriptor;
   }
@@ -1005,6 +1019,10 @@ class gpgpu_t {
   struct {
     uint64_t mma = 0, commit = 0, wait = 0, completion = 0, wait_checks = 0;
   } ptx_wgmma_stats;
+  struct {
+    uint64_t mapa = 0, remote_reads = 0, remote_writes = 0,
+        barrier_arrive = 0, barrier_wait = 0, proxy_fence = 0, wait_checks = 0;
+  } ptx_cluster_stats;
   ptx_tma_statistics ptx_tma_stats;
   ptx_tma_dynamic_metadata last_ptx_tma_metadata;
   std::vector<std::shared_ptr<ptx_tma_cta_binding>> ptx_tma_ctas;
@@ -1080,13 +1098,21 @@ class gpgpu_t {
     return m_NameToTextureInfo;
   }
 
-  virtual ~gpgpu_t() {}
+  virtual ~gpgpu_t();
 
  protected:
   const gpgpu_functional_sim_config &m_function_model_config;
   FILE *ptx_inst_debug_file;
 
   class memory_space *m_global_mem;
+  std::map<uint64_t, dim3> ptx_cluster_launches;
+  std::map<std::vector<uint64_t>, std::unique_ptr<class memory_space>> ptx_cluster_shared;
+  std::map<std::vector<uint64_t>, unsigned> ptx_cluster_live_threads;
+  struct ptx_cluster_barrier_state {
+    unsigned generation = 0;
+    std::set<unsigned> arrivals, waits;
+  };
+  std::map<std::vector<uint64_t>, ptx_cluster_barrier_state> ptx_cluster_barriers;
   std::map<uint64_t, ptx_tma_descriptor> ptx_tma_descriptors;
   class memory_space *m_tex_mem;
   class memory_space *m_surf_mem;

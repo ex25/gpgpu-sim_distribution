@@ -53,6 +53,7 @@ class ptx_recognizer;
 %token <string_value> MATRIX_OPCODE
 %token <string_value> MBARRIER_OPCODE
 %token <string_value> TMA_OPCODE
+%token <string_value> CLUSTER_OPCODE
 %token <int_value>  WMMA_DIRECTIVE
 %token <int_value>  LAYOUT 
 %token <int_value>  CONFIGURATION 
@@ -463,6 +464,7 @@ instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return
 opcode_spec: MATRIX_OPCODE { recognizer->add_matrix_opcode($1); free($1); }
 	| MBARRIER_OPCODE { recognizer->add_mbarrier_opcode($1); free($1); }
 	| TMA_OPCODE { recognizer->add_tma_opcode($1); free($1); }
+	| CLUSTER_OPCODE { recognizer->add_cluster_opcode($1); free($1); }
 	| OPCODE { recognizer->add_opcode($1); } option_list
 	| OPCODE { recognizer->add_opcode($1); }
 

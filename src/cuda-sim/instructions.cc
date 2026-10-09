@@ -3783,7 +3783,17 @@ void decode_space(memory_space_t &space, ptx_thread_info *thread,
       mem = thread->get_param_memory();
       break;
     case shared_space:
-      mem = thread->m_shared_mem;
+      if (addr & 0x80000000ULL) {
+        const unsigned rank = (addr >> 24) & 0x7f;
+        if (rank >= thread->get_cluster_nctarank())
+          throw std::runtime_error("DSMEM address has invalid cluster rank");
+        if (!thread->isInFunctionalSimulationMode() && rank != thread->get_cluster_rank())
+          throw std::runtime_error("PTX DSMEM remote timing is not implemented");
+        mem = thread->get_cluster_nctarank() == 1 ? thread->m_shared_mem :
+            thread->get_gpu()->get_ptx_cluster_shared(
+                thread->get_kernel().get_uid(), thread->get_cluster_id(), rank);
+        addr &= 0xffffff;
+      } else mem = thread->m_shared_mem;
       break;
     case sstarr_space:
       mem = thread->m_sstarr_mem;
@@ -3835,13 +3845,19 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   memory_space *mem = NULL;
   addr_t addr = src1_data.u32;
+  const bool remote = space == shared_space && (addr & 0x80000000U);
 
   decode_space(space, thread, src1, mem, addr);
+  if (remote && pI->ptx_cluster_opcode.find("ld.shared::cluster.") != 0)
+    throw std::runtime_error(thread->get_location() + ": mapped address requires ld.shared::cluster");
+  if (remote) ++thread->get_gpu()->ptx_cluster_stats.remote_reads;
 
   size_t size;
   int t;
   data.u64 = 0;
   type_info_key::type_decode(type, size, t);
+  if (remote && (addr % (size / 8) || addr + size / 8 > thread->get_finfo()->get_symtab()->get_shared_next()))
+    throw std::runtime_error(thread->get_location() + ": DSMEM access exceeds declared shared memory or is misaligned");
   if (!vector_spec) {
     mem->read(addr, size / 8, &data.s64);
     if (type == S16_TYPE || type == S32_TYPE) sign_extend(data, size, dst);
@@ -4526,8 +4542,79 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
+void mapa_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const unsigned type = pI->get_type();
+  auto address = thread->get_operand_value(pI->src1(), pI->dst(), type, thread, 0);
+  auto rank = thread->get_operand_value(pI->src2(), pI->dst(), U32_TYPE, thread, 0).u32;
+  if (rank >= thread->get_cluster_nctarank() ||
+      (address.u64 & 0xffffff) >= thread->get_finfo()->get_symtab()->get_shared_next() ||
+      address.u64 > 0xffffffffULL ||
+      (!(address.u64 & 0x80000000ULL) && address.u64 >= (1ULL << 24)))
+    throw std::runtime_error("mapa rank/address outside supported cluster shared range");
+  if (!thread->isInFunctionalSimulationMode() && rank != thread->get_cluster_rank())
+    throw std::runtime_error("PTX DSMEM remote timing is not implemented");
+  ptx_reg_t result;
+  // Bit 31 distinguishes mapped rank zero from an ordinary local address.
+  result.u64 = 0x80000000ULL | (uint64_t(rank) << 24) | (address.u64 & 0xffffff);
+  thread->set_operand_value(pI->dst(), result, type, thread, pI);
+  ++thread->get_gpu()->ptx_cluster_stats.mapa;
+}
+
+void getctarank_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  auto address = thread->get_operand_value(pI->src1(), pI->dst(), pI->get_type(), thread, 0).u64;
+  if (address > 0xffffffffULL)
+    throw std::runtime_error("getctarank address exceeds supported shared address range");
+  ptx_reg_t result;
+  result.u32 = (address & 0x80000000U) ? (address >> 24) & 0x7f : thread->get_cluster_rank();
+  if (result.u32 >= thread->get_cluster_nctarank())
+    throw std::runtime_error("getctarank address has invalid cluster rank");
+  thread->set_operand_value(pI->dst(), result, U32_TYPE, thread, pI);
+}
+
+void setmaxnreg_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  throw std::runtime_error("setmaxnreg register-pool redistribution/occupancy is not implemented");
+}
+
+void cluster_barrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (!thread->isInFunctionalSimulationMode())
+    throw std::runtime_error("PTX cluster barrier timing is not implemented");
+  const std::string source(pI->ptx_cluster_opcode);
+  auto *gpu = thread->get_gpu();
+  if (source.find(".arrive") != std::string::npos) {
+    if (thread->m_cluster_arrived)
+      throw std::runtime_error("cluster barrier arrive before previous wait");
+    thread->m_cluster_generation = gpu->ptx_cluster_generation(
+        thread->get_kernel().get_uid(), thread->get_cluster_id());
+    const dim3 tid = thread->get_tid(), block = thread->get_ntid();
+    const unsigned threads = block.x * block.y * block.z;
+    const unsigned linear = tid.x + block.x * (tid.y + block.y * tid.z);
+    gpu->ptx_cluster_arrive(thread->get_kernel().get_uid(), thread->get_cluster_id(),
+        thread->get_cluster_rank() * threads + linear,
+        thread->get_cluster_nctarank() * threads);
+    thread->m_cluster_arrived = true;
+    thread->m_cluster_wait = false;
+  } else {
+    if (!thread->m_cluster_arrived)
+      throw std::runtime_error("cluster barrier wait without arrive");
+    thread->m_cluster_wait = true;
+    thread->m_cluster_arrived = false;
+    const dim3 tid = thread->get_tid(), block = thread->get_ntid();
+    const unsigned threads = block.x * block.y * block.z;
+    const unsigned linear = tid.x + block.x * (tid.y + block.y * tid.z);
+    gpu->ptx_cluster_wait(thread->get_kernel().get_uid(), thread->get_cluster_id(),
+        thread->get_cluster_rank() * threads + linear,
+        thread->get_cluster_nctarank() * threads);
+  }
+}
+
 void membar_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  // handled by timing simulator
+  // Functional shared writes are synchronous. Detailed mode uses the existing
+  // MEMORY_BARRIER_OP path to drain pending operations.
+  if (std::string(pI->get_source()).find("fence.proxy.async.shared::cluster") != std::string::npos) {
+    if (!thread->isInFunctionalSimulationMode())
+      throw std::runtime_error("PTX cluster proxy fence timing is not implemented");
+    ++thread->get_gpu()->ptx_cluster_stats.proxy_fence;
+  }
 }
 
 void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -6251,12 +6338,18 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   memory_space *mem = NULL;
   addr_t addr = addr_reg.u32;
+  const bool remote = space == shared_space && (addr & 0x80000000U);
 
   decode_space(space, thread, dst, mem, addr);
+  if (remote && pI->ptx_cluster_opcode.find("st.shared::cluster.") != 0)
+    throw std::runtime_error(thread->get_location() + ": mapped address requires st.shared::cluster");
+  if (remote) ++thread->get_gpu()->ptx_cluster_stats.remote_writes;
 
   size_t size;
   int t;
   type_info_key::type_decode(type, size, t);
+  if (remote && (addr % (size / 8) || addr + size / 8 > thread->get_finfo()->get_symtab()->get_shared_next()))
+    throw std::runtime_error(thread->get_location() + ": DSMEM access exceeds declared shared memory or is misaligned");
 
   if (!vector_spec) {
     data = thread->get_operand_value(src1, dst, type, thread, 1);

@@ -373,6 +373,11 @@ class ptx_thread_info {
   unsigned get_uid() const { return m_uid; }
 
   dim3 get_ctaid() const { return m_ctaid; }
+  dim3 get_cluster_id() const { return m_cluster_id; }
+  dim3 get_cluster_dim() const { return m_cluster_dim; }
+  unsigned get_cluster_rank() const { return m_cluster_rank; }
+  unsigned get_cluster_nctarank() const { return m_cluster_nctarank; }
+  bool is_explicit_cluster() const { return m_is_explicit_cluster; }
   dim3 get_tid() const { return m_tid; }
   dim3 get_ntid() const { return m_ntid; }
   class gpgpu_sim *get_gpu() { return (gpgpu_sim *)m_gpu; }
@@ -408,6 +413,11 @@ class ptx_thread_info {
   void set_tid(dim3 tid) { m_tid = tid; }
   void cpy_tid_to_reg(dim3 tid);
   void set_ctaid(dim3 ctaid) { m_ctaid = ctaid; }
+  void set_cluster_id(dim3 cluster) { m_cluster_id = cluster; }
+  void set_cluster_dim(dim3 dimensions) { m_cluster_dim = dimensions; }
+  void set_cluster_rank(unsigned rank) { m_cluster_rank = rank; }
+  void set_cluster_nctarank(unsigned count) { m_cluster_nctarank = count; }
+  void set_explicit_cluster(bool enabled) { m_is_explicit_cluster = enabled; }
   void set_ntid(dim3 tid) { m_ntid = tid; }
   void set_nctaid(dim3 cta_size) { m_nctaid = cta_size; }
 
@@ -511,6 +521,14 @@ class ptx_thread_info {
   bool wgmma_waiting() const {
     return m_wgmma_rendezvous && !*m_wgmma_rendezvous;
   }
+  bool cluster_waiting() const {
+    const bool blocked = m_cluster_wait && !m_gpu->ptx_cluster_ready(
+        m_kernel.get_uid(), m_cluster_id, m_cluster_generation);
+    if (blocked) ++m_gpu->ptx_cluster_stats.wait_checks;
+    return blocked;
+  }
+  bool m_cluster_wait = false, m_cluster_arrived = false;
+  unsigned m_cluster_generation = 0;
   void wgmma_check_register(const symbol *reg, bool write = false) const;
   memory_space *m_shared_mem;
   ptx_tma_transfer m_last_tma_transfer;
@@ -533,6 +551,11 @@ class ptx_thread_info {
   dim3 m_tid;
   dim3 m_nctaid;
   dim3 m_ctaid;
+  dim3 m_cluster_id;
+  dim3 m_cluster_dim;
+  unsigned m_cluster_rank;
+  unsigned m_cluster_nctarank;
+  bool m_is_explicit_cluster;
   unsigned m_gridid;
   bool m_thread_done;
   unsigned m_hw_sid;

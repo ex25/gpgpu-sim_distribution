@@ -100,6 +100,7 @@ void ptx_recognizer::init_instruction_state() {
   g_matrix_opcode.clear();
   g_mbarrier_opcode.clear();
   g_tma_opcode.clear();
+  g_cluster_opcode.clear();
   g_return_var = operand_info(gpgpu_ctx);
   init_directive_state();
 }
@@ -273,6 +274,42 @@ void ptx_recognizer::add_instruction() {
   validate_matrix_operands();
   validate_mbarrier_operands();
   validate_tma_operands();
+  if (g_opcode == MAPA_OP || g_opcode == GETCTARANK_OP) {
+    std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+    parse_assert(ops.size() == (g_opcode == MAPA_OP ? 3 : 2),
+                 "cluster address operand count mismatch");
+    const unsigned type = g_scalar_type.front();
+    const auto width = [](const operand_info &op, unsigned bits) {
+      if (!op.is_reg()) return false;
+      size_t size; int sign;
+      type_info_key::type_decode(op.get_symbol()->type()->get_key().scalar_type(), size, sign);
+      return size == bits;
+    };
+    parse_assert(width(ops[0], g_opcode == GETCTARANK_OP ? 32 : type == U64_TYPE ? 64 : 32) &&
+                 width(ops[1], type == U64_TYPE ? 64 : 32),
+                 "cluster address requires registers of the declared width");
+    if (g_opcode == MAPA_OP)
+      parse_assert(width(ops[2], 32), "mapa CTA rank requires a 32-bit register");
+  }
+  if (g_opcode == SETMAXNREG_OP) {
+    parse_assert(g_operands.size() == 1 &&
+                 (g_operands.front().get_type() == int_t || g_operands.front().get_type() == unsigned_t),
+                 "setmaxnreg requires one integer immediate register count");
+    const uint64_t count = g_operands.front().get_literal_value().u64;
+    parse_assert(count >= 24 && count <= 256 && count % 8 == 0,
+                 "setmaxnreg count must be 24..256 and a multiple of 8");
+  }
+  if (g_cluster_opcode.find("ld.shared::cluster.") == 0 ||
+      g_cluster_opcode.find("st.shared::cluster.") == 0) {
+    std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+    const bool load = g_opcode == LD_OP;
+    parse_assert(ops.size() == 2 && ops[load ? 0 : 1].is_reg() &&
+                 ops[load ? 1 : 0].is_memory_operand(),
+                 "cluster shared access requires scalar register and memory operand");
+  }
+  if (g_opcode == CLUSTER_BARRIER_OP)
+    parse_assert(g_operands.empty() && !g_pred,
+                 "aligned cluster barrier requires all threads and no operands");
   PTX_PARSE_DPRINTF("add_instruction: %s",
                     ((g_opcode > 0) ? g_opcode_string[g_opcode] : "<label>"));
   assert(g_shader_core_config != 0);
@@ -281,6 +318,7 @@ void ptx_recognizer::add_instruction() {
       g_return_var, g_options, g_wmma_options, g_scalar_type, g_space_spec,
       gpgpu_ctx->g_filename, ptx_get_lineno(scanner), linebuf,
       g_shader_core_config, gpgpu_ctx);
+  i->ptx_cluster_opcode = g_cluster_opcode;
   if (!g_matrix_opcode.empty()) {
     i->ptx_matrix.opcode = g_matrix_opcode;
     if (g_opcode == LDMATRIX_OP) {
@@ -877,6 +915,34 @@ void ptx_recognizer::add_tma_opcode(const char *opcode) {
   g_space_spec = global_space;
 }
 
+void ptx_recognizer::add_cluster_opcode(const char *opcode) {
+  const std::string text(opcode);
+  g_scalar_type.clear();
+  if (text == "mapa.shared::cluster.u32" || text == "mapa.shared::cluster.u64") {
+    g_opcode = MAPA_OP;
+    g_scalar_type.push_back(text.find(".u64") != std::string::npos ? U64_TYPE : U32_TYPE);
+  } else if (text == "getctarank.shared::cluster.u32" || text == "getctarank.shared::cluster.u64") {
+    g_opcode = GETCTARANK_OP;
+    g_scalar_type.push_back(text.find(".u64") != std::string::npos ? U64_TYPE : U32_TYPE);
+  } else if (text == "setmaxnreg.inc.sync.aligned.u32" ||
+             text == "setmaxnreg.dec.sync.aligned.u32") {
+    g_opcode = SETMAXNREG_OP;
+    g_scalar_type.push_back(U32_TYPE);
+  } else if (std::regex_match(text, std::regex(
+                 "barrier\\.cluster\\.(arrive(\\.(release|relaxed))?|wait(\\.acquire)?)\\.aligned"))) {
+    g_opcode = CLUSTER_BARRIER_OP;
+  } else if (std::regex_match(text, std::regex("(ld|st)\\.shared::cluster\\.(u32|b32|u64|b64)"))) {
+    g_opcode = text.find("ld.") == 0 ? LD_OP : ST_OP;
+    g_scalar_type.push_back(text.find("64") != std::string::npos ? U64_TYPE : U32_TYPE);
+    g_space_spec = shared_space;
+  } else {
+    parse_assert(0, "unsupported cluster opcode/modifier: %s", opcode);
+  }
+  g_cluster_opcode = text;
+  g_options.clear();
+  g_wmma_options.clear();
+}
+
 void ptx_recognizer::validate_tma_operands() {
   if (g_tma_opcode.empty()) return;
   std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
@@ -1133,6 +1199,11 @@ void ptx_recognizer::add_8vector_operand(const char *d1, const char *d2,
 
 void ptx_recognizer::add_builtin_operand(int builtin, int dim_modifier) {
   PTX_PARSE_DPRINTF("add_builtin_operand");
+  if (builtin >= CLUSTERID_REG && builtin <= IS_EXPLICIT_CLUSTER_REG) {
+    const bool scalar = builtin >= CLUSTER_CTARANK_REG;
+    parse_assert(scalar ? dim_modifier == -1 : dim_modifier >= 0,
+                 "cluster special register dimension modifier mismatch");
+  }
   g_operands.push_back(operand_info(builtin, dim_modifier, gpgpu_ctx));
 }
 

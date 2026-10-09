@@ -211,6 +211,92 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   gpu_tot_sim_cycle = 0;
 }
 
+void gpgpu_t::register_ptx_cluster_launch(uint64_t kernel, dim3 dimensions) {
+  if (!dimensions.x || !dimensions.y || !dimensions.z || dimensions.x > 8 ||
+      dimensions.y > 8 || dimensions.z > 8 ||
+      dimensions.x * dimensions.y * dimensions.z > 8)
+    throw std::runtime_error("invalid PTX cluster dimensions");
+  ptx_cluster_launches[kernel] = dimensions;
+}
+
+dim3 gpgpu_t::get_ptx_cluster_dim(uint64_t kernel) const {
+  auto it = ptx_cluster_launches.find(kernel);
+  return it == ptx_cluster_launches.end() ? dim3(1, 1, 1) : it->second;
+}
+
+gpgpu_t::~gpgpu_t() {}
+
+memory_space *gpgpu_t::get_or_create_ptx_cluster_shared(uint64_t kernel,
+                                                      dim3 cluster,
+                                                      unsigned rank) {
+  const dim3 dimensions = get_ptx_cluster_dim(kernel);
+  if (rank >= dimensions.x * dimensions.y * dimensions.z)
+    throw std::runtime_error("PTX cluster CTA rank is outside cluster dimensions");
+  const std::vector<uint64_t> key = {kernel, cluster.x, cluster.y, cluster.z, rank};
+  auto &mem = ptx_cluster_shared[key];
+  if (!mem) mem.reset(new memory_space_impl<16 * 1024>("cluster_shared", 4));
+  return mem.get();
+}
+
+void gpgpu_t::ptx_cluster_start_cta(uint64_t kernel, dim3 cluster,
+                                   unsigned rank, unsigned threads) {
+  const std::vector<uint64_t> key = {kernel, cluster.x, cluster.y, cluster.z, rank};
+  if (!threads || ptx_cluster_live_threads.count(key))
+    throw std::runtime_error("duplicate or invalid PTX cluster CTA start");
+  get_or_create_ptx_cluster_shared(kernel, cluster, rank);
+  ptx_cluster_live_threads[key] = threads;
+}
+
+void gpgpu_t::ptx_cluster_exit_thread(uint64_t kernel, dim3 cluster, unsigned rank) {
+  const std::vector<uint64_t> key = {kernel, cluster.x, cluster.y, cluster.z, rank};
+  auto it = ptx_cluster_live_threads.find(key);
+  if (it == ptx_cluster_live_threads.end() || !it->second)
+    throw std::runtime_error("invalid PTX cluster CTA exit");
+  --it->second;
+}
+
+memory_space *gpgpu_t::get_ptx_cluster_shared(uint64_t kernel, dim3 cluster,
+                                             unsigned rank) {
+  const std::vector<uint64_t> key = {kernel, cluster.x, cluster.y, cluster.z, rank};
+  auto it = ptx_cluster_live_threads.find(key);
+  if (it == ptx_cluster_live_threads.end() || !it->second)
+    throw std::runtime_error("DSMEM target CTA has not started or has exited");
+  return get_or_create_ptx_cluster_shared(kernel, cluster, rank);
+}
+
+unsigned gpgpu_t::ptx_cluster_generation(uint64_t kernel, dim3 cluster) const {
+  auto it = ptx_cluster_barriers.find({kernel, cluster.x, cluster.y, cluster.z});
+  return it == ptx_cluster_barriers.end() ? 0 : it->second.generation;
+}
+
+bool gpgpu_t::ptx_cluster_ready(uint64_t kernel, dim3 cluster,
+                               unsigned generation) const {
+  return ptx_cluster_generation(kernel, cluster) > generation;
+}
+
+void gpgpu_t::ptx_cluster_arrive(uint64_t kernel, dim3 cluster,
+                                unsigned thread, unsigned expected) {
+  auto &state = ptx_cluster_barriers[{kernel, cluster.x, cluster.y, cluster.z}];
+  if (!expected || thread >= expected || !state.arrivals.insert(thread).second)
+    throw std::runtime_error("duplicate or invalid cluster barrier arrival");
+  ++ptx_cluster_stats.barrier_arrive;
+}
+
+void gpgpu_t::ptx_cluster_wait(uint64_t kernel, dim3 cluster,
+                              unsigned thread, unsigned expected) {
+  auto &state = ptx_cluster_barriers[{kernel, cluster.x, cluster.y, cluster.z}];
+  if (!state.arrivals.count(thread) || !state.waits.insert(thread).second)
+    throw std::runtime_error("cluster barrier wait without unique arrival");
+  ++ptx_cluster_stats.barrier_wait;
+  // Functional mode rendezvous completes the phase only after every wait.
+  // This also prevents a fast CTA from reusing a barrier before peers wait.
+  if (state.arrivals.size() == expected && state.waits.size() == expected) {
+    ++state.generation;
+    state.arrivals.clear();
+    state.waits.clear();
+  }
+}
+
 new_addr_type line_size_based_tag_func(new_addr_type address,
                                        new_addr_type line_size) {
   // gives the tag for an address based on a given line size
