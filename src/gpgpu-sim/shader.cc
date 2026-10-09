@@ -1072,6 +1072,13 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   if ((*pipe_reg)->ptx_mbarrier.kind != ptx_mbarrier_op::NONE)
     m_warp[warp_id]->m_ptx_sync_pending = true;
 
+  if (next_inst->ptx_matrix.wgmma == ptx_matrix_metadata::WAIT) {
+    m_warp[warp_id]->m_ptx_wgmma_wait_group = next_inst->ptx_matrix.wait_group;
+    printf("WGMMA_DETAIL event=wait warp=%u cycle=%llu limit=%u\n", warp_id,
+        (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle),
+        next_inst->ptx_matrix.wait_group);
+  }
+
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
   if (next_inst->m_is_ldgsts) {
@@ -1118,6 +1125,11 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
             "Adding outstanding GMMA to track, instruction m_uid: %d\n",
             gmma_inst->get_uid());
     m_warp[warp_id]->add_outstanding_gmma(gmma_inst->get_uid());
+    if (next_inst->ptx_matrix.wgmma == ptx_matrix_metadata::MMA)
+      printf("WGMMA_DETAIL event=issue warp=%u cycle=%llu uid=%u n=%u latency=%u ii=%u\n",
+          warp_id, (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle),
+          gmma_inst->get_uid(), next_inst->ptx_matrix.n, next_inst->latency,
+          next_inst->initiation_interval);
   }
 
   if (next_inst->op == BARRIER_OP) {
@@ -1267,6 +1279,26 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
   m_scoreboard->reserveRegisters(*pipe_reg);
   m_warp[warp_id]->set_next_pc(next_inst->pc + next_inst->isize);
+}
+
+bool shader_core_ctx::ptx_wgmma_waiting(unsigned warp_id) {
+  auto *thread = m_thread[warp_id * m_config->warp_size];
+  if (!thread || thread->is_done()) return false;
+  if (thread->wgmma_waiting()) return true;
+  int limit = m_warp[warp_id]->m_ptx_wgmma_wait_group;
+  if (limit < 0) return false;
+  // An aligned PTX wait observes every warp in the same 128-thread group.
+  for (auto *peer : thread->m_cta_info->wgmma_threads(thread)) {
+    auto *warp = m_warp[peer->get_hw_wid()];
+    if (warp->m_gmma_commited_groups.size() > unsigned(limit)) {
+      ++m_gpu->ptx_wgmma_stats.wait_checks;
+      return true;
+    }
+  }
+  m_warp[warp_id]->m_ptx_wgmma_wait_group = -1;
+  printf("WGMMA_DETAIL event=release warp=%u cycle=%llu limit=%d\n", warp_id,
+      (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle), limit);
+  return false;
 }
 
 bool shader_core_ctx::check_trywait_ready(const warp_inst_t *pI,
@@ -1718,6 +1750,9 @@ void scheduler_unit::cycle() {
                            previous_issued_inst_exec_type ==
                                exec_unit_type_t::SPECIALIZED)) {
                 unsigned spec_id = pI->op - SPEC_UNIT_START_ID;
+                if (pI->ptx_matrix.wgmma == ptx_matrix_metadata::MMA &&
+                    spec_id >= m_shader->m_config->m_specialized_unit.size())
+                  throw std::runtime_error("PTX WGMMA requires enabled specialized_unit_1..5 (GMMA)");
                 assert(spec_id < m_shader->m_config->m_specialized_unit.size());
                 register_set *spec_reg_set = m_spec_cores_out[spec_id];
                 bool spec_pipe_avail =
@@ -2183,6 +2218,12 @@ void shader_core_ctx::writeback() {
     // Decrement the outstanding GMMA instruction
     if (pipe_reg->is_gmma()) {
       m_warp[pipe_reg->warp_id()]->dec_gmma_outstanding(pipe_reg->get_uid());
+      if (pipe_reg->ptx_matrix.wgmma == ptx_matrix_metadata::MMA) {
+        ++m_gpu->ptx_wgmma_stats.completion;
+        printf("WGMMA_DETAIL event=complete warp=%u cycle=%llu uid=%u\n",
+            pipe_reg->warp_id(), (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle),
+            pipe_reg->get_uid());
+      }
     }
 
     /*
@@ -2787,6 +2828,10 @@ void specialized_unit ::issue(register_set &source_reg) {
   warp_inst_t **ready_reg =
       source_reg.get_ready(m_config->sub_core_model, m_issue_reg_id);
   // m_core->incexecstat((*ready_reg));
+  if ((*ready_reg)->ptx_matrix.wgmma == ptx_matrix_metadata::MMA)
+    printf("WGMMA_DETAIL event=unit warp=%u cycle=%llu uid=%u scheduler=%u\n",
+        (*ready_reg)->warp_id(), (unsigned long long)m_core->get_gpu()->global_cycle(),
+        (*ready_reg)->get_uid(), m_issue_reg_id);
   (*ready_reg)->op_pipe = SPECIALIZED__OP;
   m_core->incsp_stat(m_core->get_config()->warp_size, (*ready_reg)->latency);
   pipelined_simd_unit::issue(source_reg);
@@ -5170,6 +5215,7 @@ bool shd_warp_t::waiting() {
     m_waiting_gmma_group = m_gmma_outstanding.size() > 0;
   }
   waiting |= m_waiting_gmma_group;
+  waiting |= m_shader->ptx_wgmma_waiting(m_warp_id);
   // Waiting for NANOSLEEP to expire
   if (m_nanosleep_until > 0) {
     uint64_t current_cycle = m_shader->get_gpu()->gpu_tot_sim_cycle +

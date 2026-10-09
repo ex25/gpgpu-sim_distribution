@@ -299,6 +299,17 @@ void ptx_recognizer::add_instruction() {
         i->ptx_matrix.k = 16;
       }
     }
+    if (i->ptx_matrix.kind == ptx_matrix_metadata::WGMMA) {
+      auto &matrix = i->ptx_matrix;
+      matrix.functional_supported = matrix.timing_supported = true;
+      matrix.wgmma = g_opcode == WGMMA_MMA_OP ? ptx_matrix_metadata::MMA :
+          g_opcode == WGMMA_FENCE_OP ? ptx_matrix_metadata::FENCE :
+          g_opcode == WGMMA_COMMIT_OP ? ptx_matrix_metadata::COMMIT :
+          ptx_matrix_metadata::WAIT;
+      if (g_opcode == WGMMA_WAIT_OP)
+        matrix.wait_group = g_operands.front().get_literal_value().u32;
+      i->m_is_gmma_commit_group = g_opcode == WGMMA_COMMIT_OP;
+    }
     if (!g_operands.empty() && g_operands.front().is_vector()) {
       const operand_info &dst = g_operands.front();
       for (unsigned r = 0; r < dst.get_vect_nelem(); ++r)
@@ -902,6 +913,8 @@ void ptx_recognizer::validate_tma_operands() {
 void ptx_recognizer::validate_matrix_operands() {
   if (g_matrix_opcode.empty()) return;
   std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+  if (g_matrix_opcode.find("wgmma.") == 0)
+    parse_assert(!g_pred, "predicated wgmma is unsupported: full warpgroup required");
   const auto tuple = [&](unsigned pos, unsigned count, int type) {
     parse_assert(pos < ops.size() && ops[pos].is_vector() &&
                  ops[pos].get_vect_nelem() == count, "matrix register tuple length mismatch");
@@ -935,19 +948,26 @@ void ptx_recognizer::validate_matrix_operands() {
     tuple(3, 4, F32_TYPE);
   } else if (g_opcode == WGMMA_MMA_OP) {
     bool registers = ops.size() > 1 && ops[1].is_vector();
-    parse_assert(ops.size() == (registers ? 7 : 5), "wgmma operand count mismatch");
+    parse_assert(ops.size() == (registers ? 7 : 8), "wgmma operand count mismatch");
     tuple(0, g_matrix_opcode.find("n176") != std::string::npos ? 88 : 64, F32_TYPE);
-    if (registers) {
-      tuple(1, 4, B32_TYPE);
-      reg(2, 64); reg(3, 1);
-      for (unsigned p = 4; p < ops.size(); ++p)
-        parse_assert(ops[p].is_literal(), "wgmma scale/transpose requires an immediate");
-    } else {
-      for (unsigned p = 1; p < ops.size(); ++p) reg(p, 64);
+    if (registers) tuple(1, 4, B32_TYPE);
+    else reg(1, 64);
+    reg(2, 64);
+    parse_assert(ops[3].get_type() == int_t || (ops[3].is_reg() &&
+        ops[3].get_symbol()->type()->get_key().scalar_type() == PRED_TYPE),
+        "wgmma scale-d requires a predicate or 0/1 immediate");
+    if (ops[3].get_type() == int_t)
+      parse_assert(ops[3].get_literal_value().s64 == 0 ||
+          ops[3].get_literal_value().s64 == 1, "wgmma scale-d must be 0 or 1");
+    for (unsigned p = 4; p < ops.size(); ++p) {
+      parse_assert(ops[p].get_type() == int_t, "wgmma scale/transpose requires an immediate");
+      long long value = ops[p].get_literal_value().s64;
+      parse_assert(p < 6 ? (value == -1 || value == 1) : (value == 0 || value == 1),
+                   "wgmma scale/transpose immediate out of range");
     }
   } else if (g_opcode == WGMMA_WAIT_OP) {
-    parse_assert(ops.size() == 1 && ops[0].is_literal(), "wgmma.wait_group requires one immediate");
-    int count = ops[0].get_literal_value().s32;
+    parse_assert(ops.size() == 1 && ops[0].get_type() == int_t, "wgmma.wait_group requires one immediate");
+    long long count = ops[0].get_literal_value().s64;
     parse_assert(count >= 0 && count <= 7, "wgmma.wait_group immediate must be 0..7");
   } else {
     parse_assert(ops.empty(), "wgmma fence/commit take no operands");
@@ -1227,6 +1247,10 @@ void ptx_recognizer::change_operand_neg() {
 
 void ptx_recognizer::add_literal_int(int value) {
   PTX_PARSE_DPRINTF("add_literal_int");
+  g_operands.push_back(operand_info(value, gpgpu_ctx));
+}
+
+void ptx_recognizer::add_literal_int64(unsigned long long value) {
   g_operands.push_back(operand_info(value, gpgpu_ctx));
 }
 

@@ -168,6 +168,153 @@ int acc_float_offset(int index, int wmma_layout, int stride) {
 }
 
 void inst_not_implemented(const ptx_instruction *pI);
+namespace {
+// PTX m64nNk16 fragment coordinates, indexed by warpgroup-local thread.
+unsigned wgmma_row(unsigned tid, unsigned element) {
+  return (tid / 32) * 16 + (tid % 32) / 4 + ((element % 4) / 2) * 8;
+}
+unsigned wgmma_column(unsigned tid, unsigned element) {
+  return (element / 4) * 8 + (tid % 4) * 2 + element % 2;
+}
+float wgmma_half(uint16_t bits) {
+  ptx_reg_t value;
+  memcpy(&value.f16, &bits, sizeof(bits));
+  return float(value.f16);
+}
+std::vector<float> wgmma_shared(ptx_thread_info *thread, uint64_t descriptor,
+                               unsigned mn, bool transpose) {
+  const uint64_t allowed = 0x3fffULL | (0x3fffULL << 16) | (0x3fffULL << 32);
+  if (descriptor & ~allowed)
+    throw std::runtime_error(thread->get_location() + ": unsupported WGMMA descriptor swizzle/reserved bits");
+  const unsigned base = (descriptor & 0x3fff) * 16;
+  const unsigned leading = ((descriptor >> 16) & 0x3fff) * 16;
+  const unsigned stride = ((descriptor >> 32) & 0x3fff) * 16;
+  if (!leading || !stride)
+    throw std::runtime_error(thread->get_location() + ": invalid WGMMA descriptor stride");
+  std::vector<float> result(mn * 16);
+  std::set<unsigned> addresses;
+  const unsigned capacity = thread->get_finfo()->get_symtab()->get_shared_next();
+  for (unsigned row = 0; row < mn; ++row) {
+    for (unsigned k = 0; k < 16; ++k) {
+      unsigned offset = transpose ?
+          (row % 8) * 2 + (row / 8) * stride + (k % 8) * 16 + (k / 8) * leading :
+          (row % 8) * 16 + (row / 8) * stride + (k % 8) * 2 + (k / 8) * leading;
+      unsigned address = base + offset;
+      if (address + 2 > capacity || !addresses.insert(address).second)
+        throw std::runtime_error(thread->get_location() + ": WGMMA descriptor overlaps or exceeds declared shared memory");
+      uint16_t bits;
+      thread->m_shared_mem->read(address, 2, &bits);
+      result[row * 16 + k] = wgmma_half(bits);
+    }
+  }
+  return result;
+}
+}
+
+void wgmma_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  thread->m_cta_info->wgmma_arrive(thread, pI,
+      [pI](const std::vector<ptx_thread_info *> &threads) {
+    auto *leader = threads.front();
+    const auto operation = pI->ptx_matrix.wgmma;
+    if (operation == ptx_matrix_metadata::FENCE) {
+      for (auto *t : threads) {
+        t->m_wgmma_fenced = true;
+        t->m_wgmma_modified_after_fence.clear();
+      }
+      return;
+    }
+    if (operation == ptx_matrix_metadata::COMMIT) {
+      for (auto *t : threads) {
+        if (t->m_wgmma_groups.size() == 8)
+          throw std::runtime_error(t->get_location() + ": WGMMA exceeds eight committed groups without wait");
+        t->m_wgmma_groups.push_back(t->m_wgmma_uncommitted);
+        t->m_wgmma_uncommitted.clear();
+        t->m_wgmma_source_groups.push_back(t->m_wgmma_sources_uncommitted);
+        t->m_wgmma_sources_uncommitted.clear();
+      }
+      ++leader->get_gpu()->ptx_wgmma_stats.commit;
+      return;
+    }
+    if (operation == ptx_matrix_metadata::WAIT) {
+      for (auto *t : threads) {
+        while (t->m_wgmma_groups.size() > pI->ptx_matrix.wait_group) {
+          t->m_wgmma_groups.pop_front();
+          t->m_wgmma_source_groups.pop_front();
+        }
+      }
+      ++leader->get_gpu()->ptx_wgmma_stats.wait;
+      return;
+    }
+    for (auto *t : threads)
+      if (!t->m_wgmma_fenced)
+        throw std::runtime_error(t->get_location() + ": WGMMA MMA requires wgmma.fence");
+    const bool registers = pI->operand_lookup(1).is_vector();
+    const unsigned n = pI->ptx_matrix.n;
+    for (auto *t : threads) {
+      for (unsigned r = 0; r < n / 2; ++r)
+        if (t->m_wgmma_modified_after_fence.count(pI->operand_lookup(0).vec_symbol(r)))
+          throw std::runtime_error(t->get_location() + ": WGMMA accumulator modified after fence");
+      if (registers)
+        for (unsigned r = 0; r < 4; ++r)
+          if (t->m_wgmma_modified_after_fence.count(pI->operand_lookup(1).vec_symbol(r)))
+            throw std::runtime_error(t->get_location() + ": WGMMA source modified after fence");
+    }
+    const auto descriptor = [pI](ptx_thread_info *t, unsigned operand) {
+      return t->get_reg(pI->operand_lookup(operand).get_symbol()).u64;
+    };
+    const auto accumulate = [pI](ptx_thread_info *t) {
+      const auto &scale = pI->operand_lookup(3);
+      return scale.is_literal() ? bool(scale.get_literal_value().u32) :
+          !(t->get_reg(scale.get_symbol()).pred & 1);
+    };
+    const bool scale_d = accumulate(leader);
+    const uint64_t bdesc = descriptor(leader, 2);
+    const uint64_t adesc = registers ? 0 : descriptor(leader, 1);
+    for (auto *t : threads)
+      if (descriptor(t, 2) != bdesc || (!registers && descriptor(t, 1) != adesc) ||
+          accumulate(t) != scale_d)
+        throw std::runtime_error(t->get_location() + ": nonuniform WGMMA descriptor/scale-d in warpgroup");
+    const bool trans_b = pI->operand_lookup(registers ? 6 : 7).get_literal_value().u32;
+    std::vector<float> b = wgmma_shared(leader, bdesc, n, trans_b);
+    std::vector<float> a(64 * 16);
+    if (registers) {
+      const auto &source = pI->operand_lookup(1);
+      for (unsigned tid = 0; tid < 128; ++tid) {
+        for (unsigned r = 0; r < 4; ++r) {
+          uint32_t bits = threads[tid]->get_reg(source.vec_symbol(r)).u32;
+          threads[tid]->m_wgmma_sources_uncommitted.insert(source.vec_symbol(r));
+          for (unsigned h = 0; h < 2; ++h) {
+            unsigned element = 2 * r + h;
+            a[wgmma_row(tid, element) * 16 + wgmma_column(tid, element)] =
+                wgmma_half(bits >> (16 * h));
+          }
+        }
+      }
+    } else {
+      bool trans_a = pI->operand_lookup(6).get_literal_value().u32;
+      a = wgmma_shared(leader, adesc, 64, trans_a);
+    }
+    const float sign = pI->operand_lookup(4).get_literal_value().s32 *
+                       pI->operand_lookup(5).get_literal_value().s32;
+    const auto &destination = pI->operand_lookup(0);
+    for (unsigned tid = 0; tid < 128; ++tid) {
+      auto *t = threads[tid];
+      t->m_wgmma_internal = true;
+      for (unsigned r = 0; r < n / 2; ++r) {
+        unsigned row = wgmma_row(tid, r), col = wgmma_column(tid, r);
+        ptx_reg_t value;
+        value.f32 = scale_d ? t->get_reg(destination.vec_symbol(r)).f32 : 0;
+        for (unsigned k = 0; k < 16; ++k)
+          value.f32 += sign * a[row * 16 + k] * b[col * 16 + k];
+        t->set_reg(destination.vec_symbol(r), value);
+        t->m_wgmma_uncommitted.insert(destination.vec_symbol(r));
+      }
+      t->m_wgmma_internal = false;
+    }
+    ++leader->get_gpu()->ptx_wgmma_stats.mma;
+  });
+}
+
 void hopper_matrix_unsupported_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   (void)thread;
   inst_not_implemented(pI);
@@ -475,6 +622,8 @@ void sign_extend(ptx_reg_t &data, unsigned src_size, const operand_info &dst);
 
 void ptx_thread_info::set_reg(const symbol *reg, const ptx_reg_t &value) {
   assert(reg != NULL);
+  wgmma_check_register(reg, true);
+  if (m_wgmma_fenced && !m_wgmma_internal) m_wgmma_modified_after_fence.insert(reg);
   if (reg->name() == "_") return;
   assert(!m_regs.empty());
   assert(reg->uid() > 0);
@@ -529,6 +678,7 @@ void ptx_thread_info::resume_reg_thread(char *fname, symbol_table *symtab) {
 ptx_reg_t ptx_thread_info::get_reg(const symbol *reg) {
   static bool unfound_register_warned = false;
   assert(reg != NULL);
+  wgmma_check_register(reg);
   assert(!m_regs.empty());
   reg_map_t::iterator regs_iter = m_regs.back().find(reg);
   if (regs_iter == m_regs.back().end()) {

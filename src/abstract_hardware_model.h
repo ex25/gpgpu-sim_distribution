@@ -176,6 +176,8 @@ struct ptx_matrix_metadata {
   std::string opcode;
   unsigned m = 0, n = 0, k = 0, matrices = 0;
   bool transpose = false;
+  enum wgmma_operation { NOT_WGMMA, MMA, FENCE, COMMIT, WAIT } wgmma = NOT_WGMMA;
+  unsigned wait_group = 0;
   bool functional_supported = false;
   bool timing_supported = false;
   std::vector<unsigned> accumulator_registers;
@@ -1000,6 +1002,9 @@ class gpgpu_t {
       throw std::runtime_error("TMA descriptor address is not registered");
     return it->second;
   }
+  struct {
+    uint64_t mma = 0, commit = 0, wait = 0, completion = 0, wait_checks = 0;
+  } ptx_wgmma_stats;
   ptx_tma_statistics ptx_tma_stats;
   ptx_tma_dynamic_metadata last_ptx_tma_metadata;
   std::vector<std::shared_ptr<ptx_tma_cta_binding>> ptx_tma_ctas;

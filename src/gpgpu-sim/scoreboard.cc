@@ -134,6 +134,11 @@ bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
   for (unsigned jjj = 0; jjj < inst->incount; jjj++)
     inst_regs.insert(inst->in[jjj]);
 
+  // Async WGMMA accumulators are owned until wait_group rather than reserved
+  // as ordinary outputs. Their prior synchronous writers must still finish.
+  if (inst->ptx_matrix.wgmma == ptx_matrix_metadata::MMA)
+    for (unsigned reg : inst->ptx_matrix.accumulator_registers)
+      inst_regs.insert(reg);
   if (inst->pred > 0) inst_regs.insert(inst->pred);
   if (inst->ar1 > 0) inst_regs.insert(inst->ar1);
   if (inst->ar2 > 0) inst_regs.insert(inst->ar2);

@@ -168,6 +168,7 @@ class shd_warp_t {
     clear_last_depbar_group_type();
     m_waiting_tma_bulk_group = false;
     m_waiting_gmma_group = false;
+    m_ptx_wgmma_wait_group = -1;
     m_tma_stores_outstanding.clear();
     m_tma_commited_groups.clear();
     m_gmma_outstanding.clear();
@@ -220,6 +221,7 @@ class shd_warp_t {
     clear_last_depbar_group_type();
     m_waiting_tma_bulk_group = false;
     m_waiting_gmma_group = false;
+    m_ptx_wgmma_wait_group = -1;
     m_tma_stores_outstanding.clear();
     m_tma_commited_groups.clear();
     m_gmma_outstanding.clear();
@@ -702,6 +704,7 @@ class shd_warp_t {
   // Whether this warp is waiting for one or more GMMA groups to complete, due
   // to wgmma.wait_group instruction.
   bool m_waiting_gmma_group;
+  int m_ptx_wgmma_wait_group;
 
   friend class shader_core_ctx;
 };
@@ -2715,6 +2718,7 @@ class shader_core_mem_fetch_allocator : public mem_fetch_allocator {
 
 class shader_core_ctx : public core_t {
  public:
+  bool ptx_wgmma_waiting(unsigned warp_id);
   // creator:
   shader_core_ctx(class gpgpu_sim *gpu, class simt_core_cluster *cluster,
                   unsigned shader_id, unsigned tpc_id,

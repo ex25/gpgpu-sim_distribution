@@ -1030,12 +1030,18 @@ void ptx_instruction::set_opcode_and_latency() {
       latency = int_latency[5];
       initiation_interval = int_init[5];
       break;
-    case LDMATRIX_OP:
-    case MMA_SYNC_OP:
     case WGMMA_MMA_OP:
+      op = SPECIALIZED_UNIT_5_OP;
+      latency = initiation_interval = ptx_matrix.n / 2;
+      break;
     case WGMMA_FENCE_OP:
     case WGMMA_COMMIT_OP:
     case WGMMA_WAIT_OP:
+      op = ALU_OP;
+      latency = initiation_interval = 1;
+      break;
+    case LDMATRIX_OP:
+    case MMA_SYNC_OP:
       // These carry frontend metadata only; timing fetch fails explicitly.
       op = NO_OP;
       break;
@@ -1211,6 +1217,18 @@ void ptx_instruction::pre_decode() {
       } else if (o.is_vector()) {
         for (unsigned v = 0; v < o.get_vect_nelem(); ++v) input(o.vec_symbol(v));
       } else if (o.is_reg() || o.is_memory_operand()) input(o.get_symbol());
+      continue;
+    }
+    if (m_opcode == WGMMA_MMA_OP && n > 0) {
+      const auto input = [&](const symbol *symbol) {
+        if (!symbol || !symbol->is_reg()) return;
+        if (m >= MAX_INPUT_VALUES) throw std::runtime_error("WGMMA input register limit exceeded");
+        operand_info reg(symbol, gpgpu_ctx);
+        in[m] = reg.reg_num(); arch_reg.src[m] = reg.arch_reg_num(); ++m;
+      };
+      if (o.is_vector())
+        for (unsigned v = 0; v < o.get_vect_nelem(); ++v) input(o.vec_symbol(v));
+      else if (o.is_reg()) input(o.get_symbol());
       continue;
     }
     if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
@@ -1898,6 +1916,9 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
         pI = pJ;
       }
 
+      if (pI->ptx_matrix.kind == ptx_matrix_metadata::WGMMA &&
+          inst.active_count() != MAX_WARP_SIZE)
+        throw std::runtime_error(get_location() + ": incomplete WGMMA active warp");
       if (tensorcore_op(inst_opcode)) {
         if (inst.active_count() != MAX_WARP_SIZE) {
           printf(
@@ -2870,7 +2891,8 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
 
 void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
                                     bool &someOneLive) {
-  if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
+  if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0 &&
+      !m_thread[i * m_warp_size]->wgmma_waiting()) {
     warp_inst_t inst = getExecuteWarp(i);
     execute_warp_inst_t(inst, i);
     if (inst.isatomic()) inst.do_atomic(true);

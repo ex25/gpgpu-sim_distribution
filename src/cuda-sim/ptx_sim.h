@@ -154,12 +154,17 @@ class operand_info;
 class symbol_table;
 class function_info;
 class ptx_thread_info;
+class ptx_instruction;
+class symbol;
 
 class ptx_cta_info {
  public:
   ptx_cta_info(unsigned sm_idx, gpgpu_context *ctx);
   void add_thread(ptx_thread_info *thd);
   unsigned num_threads() const;
+  std::vector<ptx_thread_info *> wgmma_threads(ptx_thread_info *thread) const;
+  void wgmma_arrive(ptx_thread_info *thread, const ptx_instruction *instruction,
+      std::function<void(const std::vector<ptx_thread_info *> &)> execute);
   void check_cta_thread_status_and_reset();
   void register_thread_exit(ptx_thread_info *thd);
   void register_deleted_thread(ptx_thread_info *thd);
@@ -198,6 +203,12 @@ class ptx_cta_info {
   std::set<ptx_thread_info *> m_dangling_pointers;
   std::map<addr_t, mbarrier_t> m_mbarriers;
   std::vector<std::function<void()>> m_tma_pending;
+  struct wgmma_collective {
+    unsigned pc = 0;
+    std::set<ptx_thread_info *> arrived;
+    std::shared_ptr<bool> ready;
+  };
+  std::map<unsigned, wgmma_collective> m_wgmma_collectives;
 };
 
 class ptx_warp_info {
@@ -489,6 +500,18 @@ class ptx_thread_info {
   bool m_branch_taken;
   memory_space_t m_last_memory_space;
   dram_callback_t m_last_dram_callback;
+  // Per-thread async register ownership; generic access requires wait_group.
+  std::shared_ptr<bool> m_wgmma_rendezvous;
+  bool m_wgmma_fenced = false, m_wgmma_internal = false;
+  std::set<const symbol *> m_wgmma_modified_after_fence;
+  std::set<const symbol *> m_wgmma_sources_uncommitted;
+  std::deque<std::set<const symbol *>> m_wgmma_source_groups;
+  std::set<const symbol *> m_wgmma_uncommitted;
+  std::deque<std::set<const symbol *>> m_wgmma_groups;
+  bool wgmma_waiting() const {
+    return m_wgmma_rendezvous && !*m_wgmma_rendezvous;
+  }
+  void wgmma_check_register(const symbol *reg, bool write = false) const;
   memory_space *m_shared_mem;
   ptx_tma_transfer m_last_tma_transfer;
   uint32_t m_last_tma_bar = 0, m_last_tma_mask = 0;

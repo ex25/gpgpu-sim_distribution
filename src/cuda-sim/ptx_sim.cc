@@ -55,6 +55,62 @@ void ptx_cta_info::add_thread(ptx_thread_info *thd) {
 
 unsigned ptx_cta_info::num_threads() const { return m_threads_in_cta.size(); }
 
+namespace {
+unsigned wgmma_tid(const ptx_thread_info *thread) {
+  const dim3 t = thread->get_tid(), n = thread->get_ntid();
+  return t.x + n.x * (t.y + n.y * t.z);
+}
+}
+
+std::vector<ptx_thread_info *> ptx_cta_info::wgmma_threads(ptx_thread_info *thread) const {
+  const dim3 n = thread->get_ntid();
+  const unsigned base = wgmma_tid(thread) / 128 * 128;
+  if (base + 128 > n.x * n.y * n.z)
+    throw std::runtime_error(thread->get_location() + ": incomplete WGMMA warpgroup: requires 128 threads");
+  std::vector<ptx_thread_info *> threads(128, nullptr);
+  for (auto *t : m_threads_in_cta) {
+    unsigned id = wgmma_tid(t);
+    if (id >= base && id < base + 128) threads[id - base] = t;
+  }
+  for (auto *t : threads)
+    if (!t || t->is_done())
+      throw std::runtime_error(thread->get_location() + ": incomplete WGMMA warpgroup: missing/live thread");
+  return threads;
+}
+
+void ptx_cta_info::wgmma_arrive(ptx_thread_info *thread, const ptx_instruction *instruction,
+    std::function<void(const std::vector<ptx_thread_info *> &)> execute) {
+  auto threads = wgmma_threads(thread);
+  unsigned group = wgmma_tid(thread) / 128;
+  auto &pending = m_wgmma_collectives[group];
+  if (!pending.ready) {
+    pending.ready = std::make_shared<bool>(false);
+    pending.pc = instruction->pc;
+  }
+  if (pending.pc != thread->get_pc() || !pending.arrived.insert(thread).second)
+    throw std::runtime_error(thread->get_location() + ": divergent WGMMA warpgroup instruction");
+  thread->m_wgmma_rendezvous = pending.ready;
+  if (pending.arrived.size() == 128) {
+    execute(threads);
+    *pending.ready = true;
+    m_wgmma_collectives.erase(group);
+  }
+}
+
+void ptx_thread_info::wgmma_check_register(const symbol *reg, bool write) const {
+  if (m_wgmma_internal) return;
+  bool pending = m_wgmma_uncommitted.count(reg);
+  for (const auto &group : m_wgmma_groups) pending |= group.count(reg);
+  if (write) {
+    bool source = m_wgmma_sources_uncommitted.count(reg);
+    for (const auto &group : m_wgmma_source_groups) source |= group.count(reg);
+    if (source)
+      throw std::runtime_error(get_location() + ": WGMMA source overwrite before wait_group: " + reg->name());
+  }
+  if (pending)
+    throw std::runtime_error(get_location() + ": WGMMA accumulator access before wait_group: " + reg->name());
+}
+
 void ptx_cta_info::check_cta_thread_status_and_reset() {
   bool fail = false;
   if (m_threads_that_have_exited.size() != m_threads_in_cta.size()) {
@@ -112,12 +168,19 @@ void ptx_cta_info::check_cta_thread_status_and_reset() {
   if (fail2) {
     abort();
   }
+  m_wgmma_collectives.clear();
   m_threads_in_cta.clear();
   m_threads_that_have_exited.clear();
   m_dangling_pointers.clear();
 }
 
 void ptx_cta_info::register_thread_exit(ptx_thread_info *thd) {
+  for (const auto &pending : m_wgmma_collectives)
+    if (pending.first == (thd->get_tid().x + thd->get_ntid().x *
+        (thd->get_tid().y + thd->get_ntid().y * thd->get_tid().z)) / 128)
+      throw std::runtime_error(thd->get_location() + ": incomplete WGMMA warpgroup at exit");
+  if (!thd->m_wgmma_uncommitted.empty() || !thd->m_wgmma_groups.empty())
+    throw std::runtime_error(thd->get_location() + ": WGMMA accumulator exit before wait");
   assert(m_threads_that_have_exited.find(thd) ==
          m_threads_that_have_exited.end());
   m_threads_that_have_exited.insert(thd);

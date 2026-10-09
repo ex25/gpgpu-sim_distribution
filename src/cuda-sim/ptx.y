@@ -43,6 +43,7 @@ class ptx_recognizer;
   double double_value;
   float  float_value;
   int    int_value;
+  unsigned long long int64_value;
   char * string_value;
   void * ptr_value;
 }
@@ -93,6 +94,7 @@ class ptx_recognizer;
 %token  WEAK_DIRECTIVE
 %token  <string_value> IDENTIFIER
 %token  <int_value> INT_OPERAND
+%token  <int64_value> INT64_OPERAND
 %token  <float_value> FLOAT_OPERAND
 %token  <double_value> DOUBLE_OPERAND
 %token  S8_TYPE
@@ -656,6 +658,7 @@ twin_operand : IDENTIFIER PLUS IDENTIFIER { recognizer->add_double_operand($1,$3
 	;
 
 literal_operand : INT_OPERAND { recognizer->add_literal_int($1); }
+    | INT64_OPERAND { recognizer->add_literal_int64($1); }
 	| FLOAT_OPERAND { recognizer->add_literal_float($1); }
 	| DOUBLE_OPERAND { recognizer->add_literal_double($1); }
 	;
