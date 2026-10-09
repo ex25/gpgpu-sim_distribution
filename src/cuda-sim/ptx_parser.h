@@ -38,7 +38,7 @@ class ptx_recognizer {
  public:
   ptx_recognizer(gpgpu_context *ctx) : g_return_var(ctx) {
     scanner = NULL;
-    g_size = -1;
+    g_size = 0;
     g_add_identifier_cached__identifier = NULL;
     g_alignment_spec = -1;
     g_var_type = NULL;
@@ -66,7 +66,7 @@ class ptx_recognizer {
 #define PTX_LINEBUF_SIZE (4 * 1024)
   char linebuf[PTX_LINEBUF_SIZE];
   unsigned col;
-  int g_size;
+  size_t g_size;
   char *g_add_identifier_cached__identifier;
   int g_add_identifier_cached__array_dim;
   int g_add_identifier_cached__array_ident;

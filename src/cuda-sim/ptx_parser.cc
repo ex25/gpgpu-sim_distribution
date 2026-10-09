@@ -80,7 +80,7 @@ void ptx_recognizer::init_directive_state() {
   g_vector_spec = -1;
   g_opcode = -1;
   g_alignment_spec = -1;
-  g_size = -1;
+  g_size = 0;
   g_extern_spec = 0;
   g_scalar_type.clear();
   g_operands.clear();
@@ -299,6 +299,94 @@ void ptx_recognizer::add_instruction() {
     parse_assert(count >= 24 && count <= 256 && count % 8 == 0,
                  "setmaxnreg count must be 24..256 and a multiple of 8");
   }
+  if (g_opcode == ELECT_OP) {
+    std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+    parse_assert(ops.size() == 2 && ops[0].is_vector() &&
+                 ops[0].get_vect_nelem() == 2 &&
+                 ops[0].get_double_operand_type() == -2,
+                 "elect.sync requires a 32-bit register|predicate destination and membermask");
+    const symbol *lane = ops[0].vec_symbol(0), *pred = ops[0].vec_symbol(1);
+    parse_assert(lane->is_reg() && pred->is_reg() &&
+                 (lane->type()->get_key().scalar_type() == B32_TYPE ||
+                  lane->type()->get_key().scalar_type() == U32_TYPE) &&
+                 pred->type()->get_key().scalar_type() == PRED_TYPE,
+                 "elect.sync destination types must be .b32/.u32 and .pred");
+    const bool register_mask = ops[1].is_reg() && !ops[1].is_vector() &&
+        (ops[1].get_symbol()->type()->get_key().scalar_type() == B32_TYPE ||
+         ops[1].get_symbol()->type()->get_key().scalar_type() == U32_TYPE);
+    parse_assert(register_mask || ops[1].get_type() == int_t ||
+                 ops[1].get_type() == unsigned_t,
+                 "elect.sync membermask must be a 32-bit register or integer immediate");
+  }
+  if (g_opcode == PREFETCH_TENSORMAP_OP) {
+    parse_assert(g_operands.size() == 1 && g_operands.front().is_memory_operand(),
+                 "prefetch.tensormap requires one bracketed address");
+    const symbol *address = g_operands.front().get_symbol();
+    parse_assert(address && (!address->is_reg() ||
+                 address->type()->get_key().scalar_type() == B64_TYPE ||
+                 address->type()->get_key().scalar_type() == U64_TYPE),
+                 "prefetch.tensormap address register must be 64-bit");
+  }
+  if (g_opcode == HOPPER_FRONTEND_ONLY_OP) {
+    if (g_cluster_opcode == "griddepcontrol.wait") {
+      parse_assert(g_operands.empty(), "griddepcontrol.wait takes no operands");
+    } else if (g_cluster_opcode == "cp.async.bulk.commit_group") {
+      parse_assert(g_operands.empty(), "cp.async.bulk.commit_group takes no operands");
+    } else if (g_cluster_opcode == "cp.async.bulk.wait_group.read") {
+      parse_assert(g_operands.size() == 1 &&
+                   (g_operands.front().get_type() == int_t ||
+                    g_operands.front().get_type() == unsigned_t) &&
+                   g_operands.front().get_literal_value().u64 == 0,
+                   "frontend scope supports cp.async.bulk.wait_group.read immediate zero only");
+    } else if (g_cluster_opcode.find("cp.async.bulk.tensor.") == 0) {
+      std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+      parse_assert(ops.size() == 3 && ops[0].is_reg() && !ops[0].is_vector() &&
+                   (ops[0].get_symbol()->type()->get_key().scalar_type() == B64_TYPE ||
+                    ops[0].get_symbol()->type()->get_key().scalar_type() == U64_TYPE) &&
+                   ops[1].is_vector() && ops[1].get_vect_nelem() == 5 &&
+                   ops[2].is_memory_operand(),
+                   "TMA store requires a 64-bit descriptor, five coordinates and shared address");
+      const symbol *address = ops[2].get_symbol();
+      parse_assert(address && (address->is_shared() ||
+                   (address->is_reg() &&
+                    (address->type()->get_key().scalar_type() == B32_TYPE ||
+                     address->type()->get_key().scalar_type() == U32_TYPE ||
+                     address->type()->get_key().scalar_type() == B64_TYPE ||
+                     address->type()->get_key().scalar_type() == U64_TYPE))),
+                   "TMA store shared address must be a shared symbol or 32/64-bit register");
+      for (unsigned r = 0; r < 5; ++r) {
+        const symbol *s = ops[1].vec_symbol(r);
+        parse_assert(s && s->is_reg() &&
+                     (s->type()->get_key().scalar_type() == B32_TYPE ||
+                      s->type()->get_key().scalar_type() == S32_TYPE ||
+                      s->type()->get_key().scalar_type() == U32_TYPE),
+                     "TMA store coordinates must be 32-bit registers");
+      }
+    } else if (g_cluster_opcode.find("stmatrix.") == 0) {
+      std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+      parse_assert(ops.size() == 2 && ops[0].is_memory_operand() &&
+                   ops[1].is_vector() && ops[1].get_vect_nelem() == 4,
+                   "stmatrix.x4 requires a shared address and four source registers");
+      const symbol *address = ops[0].get_symbol();
+      parse_assert(address && (address->is_shared() ||
+                   (address->is_reg() &&
+                    (address->type()->get_key().scalar_type() == B32_TYPE ||
+                     address->type()->get_key().scalar_type() == U32_TYPE ||
+                     address->type()->get_key().scalar_type() == B64_TYPE ||
+                     address->type()->get_key().scalar_type() == U64_TYPE))),
+                   "stmatrix address must be a shared symbol or 32/64-bit register");
+      for (unsigned r = 0; r < 4; ++r) {
+        const symbol *s = ops[1].vec_symbol(r);
+        parse_assert(s && s->is_reg() &&
+                     (s->type()->get_key().scalar_type() == B32_TYPE ||
+                      s->type()->get_key().scalar_type() == U32_TYPE),
+                     "stmatrix sources must be 32-bit registers");
+      }
+    } else {
+      parse_assert(g_operands.empty() && !g_pred,
+                   "fence.mbarrier_init requires no operands or predication");
+    }
+  }
   if (g_cluster_opcode.find("ld.shared::cluster.") == 0 ||
       g_cluster_opcode.find("st.shared::cluster.") == 0) {
     std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
@@ -466,9 +554,6 @@ int pad_address(new_addr_type address, unsigned size, unsigned maxalign) {
 
 void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
                                     unsigned array_ident) {
-  if (array_ident == ARRAY_IDENTIFIER) {
-    g_size *= array_dim;
-  }
   if (g_func_decl && (g_func_info == NULL)) {
     // return variable decl...
     assert(g_add_identifier_cached__identifier == NULL);
@@ -487,6 +572,12 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
   unsigned addr_pad;
   new_addr_type addr;
   ti.type_decode(num_bits, basic_type);
+  if (g_func_decl && g_vector_spec != -1) {
+    const unsigned lanes = g_vector_spec == V2_TYPE ? 2 :
+                           g_vector_spec == V3_TYPE ? 3 : 4;
+    num_bits *= lanes;
+    g_size *= lanes;
+  }
 
   bool duplicates = check_for_duplicates(identifier);
   if (duplicates) {
@@ -501,10 +592,18 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
 
   assert(g_var_type != NULL);
   switch (array_ident) {
-    case ARRAY_IDENTIFIER:
+    case ARRAY_IDENTIFIER: {
+      const size_t element_bytes = (num_bits + 7) / 8;
+      parse_assert(array_dim > 0 && element_bytes > 0 &&
+                       size_t(array_dim) <=
+                           std::numeric_limits<size_t>::max() / num_bits &&
+                       size_t(array_dim) <=
+                           std::numeric_limits<unsigned>::max() / element_bytes,
+                   "array size exceeds unsigned symbol address range");
       type = g_current_symbol_table->get_array_type(type, array_dim);
       num_bits = array_dim * num_bits;
       break;
+    }
     case ARRAY_IDENTIFIER_NO_DIM:
       type = g_current_symbol_table->get_array_type(type, (unsigned)-1);
       num_bits = 0;
@@ -672,14 +771,19 @@ void ptx_recognizer::add_constptr(const char *identifier1,
 }
 
 void ptx_recognizer::add_function_arg() {
-  assert(g_size > 0);
+  parse_assert(g_last_symbol != NULL && g_last_symbol->get_size_in_bytes() > 0,
+               "function parameter must have a positive size");
   if (g_func_info) {
     PTX_PARSE_DPRINTF("add_function_arg \"%s\"", g_last_symbol->name().c_str());
     g_func_info->add_arg(g_last_symbol);
     unsigned alignment = (g_alignment_spec == -1) ? g_size : g_alignment_spec;
-    assert(alignment == 1 || alignment == 2 || alignment == 4 ||
-           alignment == 8 || alignment == 16);  // known valid alignment values
-    g_func_info->add_config_param(g_size, alignment);
+    parse_assert(function_info::valid_param_alignment(alignment),
+                 "parameter alignment must be a power of two <= 1048576");
+    try {
+      g_func_info->add_config_param(g_last_symbol->get_size_in_bytes(), alignment);
+    } catch (const std::exception &error) {
+      parse_assert(false, "%s", error.what());
+    }
   }
 }
 
@@ -693,6 +797,8 @@ void ptx_recognizer::add_alignment_spec(int spec) {
   parse_assert(
       g_alignment_spec == -1,
       "multiple .align specifiers per variable declaration not allowed.");
+  parse_assert(spec > 0 && function_info::valid_param_alignment(spec),
+               ".align must be a positive power of two <= 1048576");
   g_alignment_spec = spec;
 }
 
@@ -815,7 +921,8 @@ void ptx_recognizer::append_vector_operand(const char *identifier) {
 void ptx_recognizer::finish_vector_operand() {
   parse_assert(!g_vector_operands.empty() && g_vector_operands.size() <= 128,
                "vector tuple must contain between 1 and 128 operands");
-  if (g_matrix_opcode.empty() && g_tma_opcode.empty())
+  if (g_matrix_opcode.empty() && g_tma_opcode.empty() &&
+      g_cluster_opcode != "cp.async.bulk.tensor.5d.global.shared::cta.bulk_group")
     parse_assert(g_vector_operands.size() == 1 || g_vector_operands.size() == 2 ||
                  g_vector_operands.size() == 3 || g_vector_operands.size() == 4 ||
                  g_vector_operands.size() == 8, "unsupported legacy vector tuple length");
@@ -903,6 +1010,15 @@ void ptx_recognizer::add_mbarrier_opcode(const char *opcode) {
 
 void ptx_recognizer::add_tma_opcode(const char *opcode) {
   const std::string text(opcode);
+  if (text == "cp.async.bulk.tensor.5d.global.shared::cta.bulk_group" ||
+      text == "cp.async.bulk.commit_group" || text == "cp.async.bulk.wait_group.read") {
+    // Store completion uses bulk groups, not load mbarrier metadata.
+    g_opcode = HOPPER_FRONTEND_ONLY_OP;
+    g_cluster_opcode = text;
+    g_scalar_type.clear();
+    g_scalar_type.push_back(B64_TYPE);
+    return;
+  }
   const bool load = std::regex_match(text, std::regex(
       "cp\\.async\\.bulk\\.tensor\\.[1-5]d\\.shared::cluster\\.global(\\.tile)?\\.mbarrier::complete_tx::bytes(\\.multicast::cluster)?(\\.L2::cache_hint)?"));
   const bool prefetch = std::regex_match(text, std::regex(
@@ -918,7 +1034,24 @@ void ptx_recognizer::add_tma_opcode(const char *opcode) {
 void ptx_recognizer::add_cluster_opcode(const char *opcode) {
   const std::string text(opcode);
   g_scalar_type.clear();
-  if (text == "mapa.shared::cluster.u32" || text == "mapa.shared::cluster.u64") {
+  if (text == "elect.sync") {
+    // Frontend readiness only: execution must fail until warp rendezvous exists.
+    g_opcode = ELECT_OP;
+    g_scalar_type.push_back(U32_TYPE);
+  } else if (text == "prefetch.tensormap" || text == "prefetch.const.tensormap" ||
+             text == "prefetch.param.tensormap") {
+    g_opcode = PREFETCH_TENSORMAP_OP;
+    g_scalar_type.push_back(B64_TYPE);
+  } else if (text == "fence.mbarrier_init.release.cluster") {
+    g_opcode = HOPPER_FRONTEND_ONLY_OP;
+    g_scalar_type.push_back(B64_TYPE);
+  } else if (text == "stmatrix.sync.aligned.x4.m8n8.shared.b16") {
+    g_opcode = HOPPER_FRONTEND_ONLY_OP;
+    g_scalar_type.push_back(B16_TYPE);
+  } else if (text == "griddepcontrol.wait") {
+    g_opcode = HOPPER_FRONTEND_ONLY_OP;
+    g_scalar_type.push_back(B64_TYPE);
+  } else if (text == "mapa.shared::cluster.u32" || text == "mapa.shared::cluster.u64") {
     g_opcode = MAPA_OP;
     g_scalar_type.push_back(text.find(".u64") != std::string::npos ? U64_TYPE : U32_TYPE);
   } else if (text == "getctarank.shared::cluster.u32" || text == "getctarank.shared::cluster.u64") {
@@ -936,7 +1069,11 @@ void ptx_recognizer::add_cluster_opcode(const char *opcode) {
     g_scalar_type.push_back(text.find("64") != std::string::npos ? U64_TYPE : U32_TYPE);
     g_space_spec = shared_space;
   } else {
-    parse_assert(0, "unsupported cluster opcode/modifier: %s", opcode);
+    const bool readiness_opcode = text.find("elect.") == 0 ||
+        text.find("prefetch.") == 0 || text.find("fence.mbarrier_init.") == 0 ||
+        text.find("stmatrix.") == 0 || text.find("griddepcontrol.") == 0;
+    parse_assert(0, readiness_opcode ? "unsupported Hopper opcode/modifier: %s"
+                                    : "unsupported cluster opcode/modifier: %s", opcode);
   }
   g_cluster_opcode = text;
   g_options.clear();
@@ -1107,6 +1244,11 @@ void ptx_recognizer::add_pred(const char *identifier, int neg,
 
 void ptx_recognizer::add_option(int option) {
   PTX_PARSE_DPRINTF("add_option");
+  if (g_func_decl && g_opcode == -1 &&
+      (option == V2_TYPE || option == V3_TYPE || option == V4_TYPE)) {
+    add_vector_spec(option);
+    return;
+  }
   g_options.push_back(option);
 }
 void ptx_recognizer::add_wmma_option(int option) {

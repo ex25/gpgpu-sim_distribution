@@ -4575,6 +4575,19 @@ void setmaxnreg_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   throw std::runtime_error("setmaxnreg register-pool redistribution/occupancy is not implemented");
 }
 
+void elect_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  throw std::runtime_error("elect.sync warp rendezvous/leader election is not implemented");
+}
+
+void prefetch_tensormap_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  throw std::runtime_error("prefetch.tensormap descriptor cache/runtime is not implemented");
+}
+
+void hopper_frontend_only_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  throw std::runtime_error(pI->ptx_cluster_opcode +
+                           ": functional execution/detailed timing is not implemented");
+}
+
 void cluster_barrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (!thread->isInFunctionalSimulationMode())
     throw std::runtime_error("PTX cluster barrier timing is not implemented");

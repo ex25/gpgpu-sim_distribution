@@ -284,7 +284,7 @@ void function_info::ptx_assemble() {
   // get the instructions into instruction memory...
   unsigned num_inst = m_instructions.size();
   m_instr_mem_size = MAX_INST_SIZE * (num_inst + 1);
-  m_instr_mem = new ptx_instruction *[m_instr_mem_size];
+  m_instr_mem = new ptx_instruction *[m_instr_mem_size]();
 
   printf("GPGPU-Sim PTX: instruction assembly for function \'%s\'... ",
          m_name.c_str());
@@ -309,7 +309,7 @@ void function_info::ptx_assemble() {
     ptx_instruction *pI = *i;
     if (pI->is_label()) {
       const symbol *l = pI->get_label();
-      labels[l->name()] = n;
+      labels[l] = n;
     } else {
       gpgpu_ctx->func_sim->g_pc_to_finfo[PC] = this;
       m_instr_mem[n] = pI;
@@ -333,14 +333,14 @@ void function_info::ptx_assemble() {
     if (pI->get_opcode() == BRA_OP || pI->get_opcode() == BREAKADDR_OP ||
         pI->get_opcode() == CALLP_OP) {
       operand_info &target = pI->dst();  // get operand, e.g. target name
-      if (labels.find(target.name()) == labels.end()) {
-        printf(
+      if (labels.find(target.get_symbol()) == labels.end()) {
+        fprintf(stderr,
             "GPGPU-Sim PTX: Loader error (%s:%u): Branch label \"%s\" does not "
-            "appear in assembly code.",
+            "appear in assembly code.\n",
             pI->source_file(), pI->source_line(), target.name().c_str());
         abort();
       }
-      unsigned index = labels[target.name()];  // determine address from name
+      unsigned index = labels[target.get_symbol()];  // retain lexical scope
       unsigned PC = m_instr_mem[index]->get_PC();
       m_symtab->set_label_address(target.get_symbol(), PC);
       target.set_type(label_t);
@@ -1409,7 +1409,14 @@ void function_info::add_param_data(unsigned argn,
       tmp.offset = args->m_offset;
       tmp.type = 0;
       i->second.add_data(tmp);
-      i->second.add_offset((unsigned)args->m_offset);
+      // The parser's checked ABI layout is authoritative. Host argument
+      // offsets are retained in param_t for diagnostics but must not replace
+      // an explicit .align declaration.
+      if (m_param_configs.size() > argn &&
+          m_param_configs[argn].second != args->m_offset) {
+        printf("GPGPU-Sim PTX: WARNING host offset %zu differs from PTX ABI offset %u for parameter %u\n",
+               args->m_offset, m_param_configs[argn].second, argn);
+      }
     }
   } else {
     scratchpad_memory_param = true;
@@ -1479,8 +1486,8 @@ void function_info::add_param_data(unsigned argn,
 unsigned function_info::get_args_aligned_size() {
   if (m_args_aligned_size >= 0) return m_args_aligned_size;
 
-  unsigned param_address = 0;
-  unsigned int total_size = 0;
+  size_t total_size = 0;
+  unsigned index = 0;
   for (std::map<unsigned, param_info>::iterator i =
            m_ptx_kernel_param_info.begin();
        i != m_ptx_kernel_param_info.end(); i++) {
@@ -1488,20 +1495,23 @@ unsigned function_info::get_args_aligned_size() {
     std::string name = p.get_name();
     symbol *param = m_symtab->lookup(name.c_str());
 
-    size_t arg_size = p.get_size() / 8;  // size of param in bytes
-    total_size = (total_size + arg_size - 1) / arg_size * arg_size;  // aligned
-    p.add_offset(total_size);
-    param->set_address(param_address + total_size);
-    total_size += arg_size;
+    size_t arg_size = (p.get_size() + 7) / 8;  // size of param in bytes
+    assert(index < m_param_configs.size());
+    const std::pair<size_t, unsigned> config = m_param_configs[index++];
+    assert(config.first == arg_size);
+    p.add_offset(config.second);
+    param->set_address(config.second);
+    total_size = size_t(config.second) + arg_size;
   }
 
-  m_args_aligned_size = (total_size + 3) / 4 * 4;  // final size aligned to word
+  const size_t final_size = checked_param_offset(total_size, 1, 4);
+  m_args_aligned_size = static_cast<int64_t>(final_size);
 
   return m_args_aligned_size;
 }
 
 void function_info::finalize(memory_space *param_mem) {
-  unsigned param_address = 0;
+  get_args_aligned_size();
   for (std::map<unsigned, param_info>::iterator i =
            m_ptx_kernel_param_info.begin();
        i != m_ptx_kernel_param_info.end(); i++) {
@@ -1518,35 +1528,24 @@ void function_info::finalize(memory_space *param_mem) {
     assert(xtype == (unsigned)type);
     size_t size;
     size = param_value.size;  // size of param in bytes
-    // assert(param_value.offset == param_address);
-    if (size != p.get_size() / 8) {
+    if (size != (p.get_size() + 7) / 8) {
       printf(
           "GPGPU-Sim PTX: WARNING actual kernel paramter size = %zu bytes vs. "
           "formal size = %zu (using smaller of two)\n",
-          size, p.get_size() / 8);
-      size = (size < (p.get_size() / 8)) ? size : (p.get_size() / 8);
+          size, (p.get_size() + 7) / 8);
+      size = (size < ((p.get_size() + 7) / 8)) ? size : ((p.get_size() + 7) / 8);
     }
     // copy the parameter over word-by-word so that parameter that crosses a
     // memory page can be copied over
-    // Jin: copy parameter using aligned rules
-    const type_info *paramtype = param->type();
-    int align_amount = paramtype->get_key().get_alignment_spec();
-    align_amount = (align_amount == -1) ? size : align_amount;
-    param_address = (param_address + align_amount - 1) / align_amount *
-                    align_amount;  // aligned
-
     const size_t word_size = 4;
-    // param_address = (param_address + size - 1) / size * size; //aligned with
-    // size
+    const unsigned param_address = p.get_offset();
     for (size_t idx = 0; idx < size; idx += word_size) {
       const char *pdata = reinterpret_cast<const char *>(param_value.pdata) +
                           idx;  // cast to char * for ptr arithmetic
-      param_mem->write(param_address + idx, word_size, pdata, NULL, NULL);
+      const size_t copy_size = std::min(word_size, size - idx);
+      param_mem->write(param_address + idx, copy_size, pdata, NULL, NULL);
     }
-    unsigned offset = p.get_offset();
-    assert(offset == param_address);
     param->set_address(param_address);
-    param_address += size;
   }
 }
 

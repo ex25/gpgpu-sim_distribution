@@ -33,6 +33,8 @@
 
 #include <assert.h>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
 #include <cstring>
 #include <list>
 #include <map>
@@ -1390,15 +1392,32 @@ class function_info {
   void set_pdom() { pdom_done = true; }           // set pdom flag
 
   void add_config_param(size_t size, unsigned alignment) {
-    unsigned offset = 0;
-    if (m_param_configs.size() > 0) {
-      unsigned offset_nom =
-          m_param_configs.back().first + m_param_configs.back().second;
-      // ensure offset matches alignment requirements
-      offset = offset_nom % alignment ? (offset_nom / alignment + 1) * alignment
-                                      : offset_nom;
-    }
+    size_t end = m_param_configs.empty()
+                     ? 0
+                     : m_param_configs.back().first +
+                           size_t(m_param_configs.back().second);
+    unsigned offset = checked_param_offset(end, size, alignment);
     m_param_configs.push_back(std::pair<size_t, unsigned>(size, offset));
+    m_args_aligned_size = -1;
+  }
+
+  // Implementation bound, not a PTX architectural limit. Parameter addresses
+  // remain unsigned; validate before narrowing or performing align-up arithmetic.
+  static const unsigned max_param_alignment = 1u << 20;
+  static bool valid_param_alignment(unsigned alignment) {
+    return alignment && alignment <= max_param_alignment &&
+           !(alignment & (alignment - 1));
+  }
+  static unsigned checked_param_offset(size_t end, size_t size,
+                                       unsigned alignment) {
+    if (!valid_param_alignment(alignment) || !size)
+      throw std::invalid_argument("invalid PTX parameter size/alignment");
+    const size_t limit = std::numeric_limits<unsigned>::max();
+    const size_t padding = (alignment - end % alignment) % alignment;
+    if (end > limit || padding > limit - end ||
+        size > limit - end - padding)
+      throw std::overflow_error("PTX parameter offset/size overflow");
+    return static_cast<unsigned>(end + padding);
   }
 
   std::pair<size_t, unsigned> get_param_config(unsigned param_num) const {
@@ -1435,7 +1454,7 @@ class function_info {
   std::list<ptx_instruction *> m_instructions;
   std::vector<basic_block_t *> m_basic_blocks;
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
-  std::map<std::string, unsigned> labels;
+  std::map<const symbol *, unsigned> labels;
   unsigned num_reconvergence_pairs;
 
   // Registers/shmem/etc. used (from ptxas -v), loaded from ___.ptxinfo along
@@ -1445,7 +1464,7 @@ class function_info {
   symbol_table *m_symtab;
 
   // parameter size for device kernels
-  int m_args_aligned_size;
+  int64_t m_args_aligned_size;
 
   addr_t m_n;  // offset in m_instr_mem (used in do_pdom)
 };

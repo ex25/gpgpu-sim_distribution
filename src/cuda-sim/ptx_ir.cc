@@ -317,10 +317,11 @@ type_info *symbol_table::get_array_type(type_info *base_type,
 }
 
 void symbol_table::set_label_address(const symbol *label, unsigned addr) {
-  std::map<std::string, symbol *>::iterator i = m_symbols.find(label->name());
-  assert(i != m_symbols.end());
-  symbol *s = i->second;
-  s->set_label_address(addr);
+  // Operands expose a const view of parser-owned mutable symbols. An inline
+  // assembly group may own this label; looking up its name in the function's
+  // table loses that scope (and can resolve a different same-named label).
+  assert(label);
+  const_cast<symbol *>(label)->set_label_address(addr);
 }
 
 void symbol_table::dump() {
@@ -552,7 +553,7 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
     } else if (pI->get_opcode() == BRA_OP) {
       // find successor and link that basic_block to this one
       operand_info &target = pI->dst();  // get operand, e.g. target name
-      unsigned addr = labels[target.name()];
+      unsigned addr = labels[target.get_symbol()];
       ptx_instruction *target_pI = m_instr_mem[addr];
       basic_block_t *target_bb = target_pI->get_bb();
       (*bb_itr)->successor_ids.insert(target_bb->bb_id);
@@ -601,7 +602,7 @@ bool function_info::connect_break_targets()  // connecting break instructions
       // find successor and link that basic_block to this one
       // successor of a break is set by an preceeding breakaddr instruction
       operand_info *target = find_break_target(pI);
-      unsigned addr = labels[target->name()];
+      unsigned addr = labels[target->get_symbol()];
       ptx_instruction *target_pI = m_instr_mem[addr];
       basic_block_t *target_bb = target_pI->get_bb();
       p_bb->successor_ids.insert(target_bb->bb_id);
