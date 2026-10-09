@@ -177,6 +177,15 @@ class ptx_cta_info {
   void mbarrier_complete_tx(addr_t bar_addr, uint32_t tx_count);
   uint32_t mbarrier_pending_count(addr_t bar_addr) const;
   bool mbarrier_test_wait(addr_t bar_addr, uint32_t phase, bool parity) const;
+  void tma_submit(std::function<void()> completion) {
+    m_tma_pending.push_back(completion);
+  }
+  void tma_progress() {
+    std::vector<std::function<void()>> pending;
+    pending.swap(m_tma_pending);
+    for (auto &complete : pending) complete();
+  }
+  bool tma_has_pending() const { return !m_tma_pending.empty(); }
 
  private:
   // backward pointer
@@ -188,6 +197,7 @@ class ptx_cta_info {
   std::set<ptx_thread_info *> m_threads_that_have_exited;
   std::set<ptx_thread_info *> m_dangling_pointers;
   std::map<addr_t, mbarrier_t> m_mbarriers;
+  std::vector<std::function<void()>> m_tma_pending;
 };
 
 class ptx_warp_info {
@@ -480,6 +490,9 @@ class ptx_thread_info {
   memory_space_t m_last_memory_space;
   dram_callback_t m_last_dram_callback;
   memory_space *m_shared_mem;
+  ptx_tma_transfer m_last_tma_transfer;
+  uint32_t m_last_tma_bar = 0, m_last_tma_mask = 0;
+  std::shared_ptr<ptx_tma_completion_record> m_last_tma_completion;
   memory_space *m_sstarr_mem;
   memory_space *m_local_mem;
   ptx_warp_info *m_warp_info;

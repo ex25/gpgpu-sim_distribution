@@ -579,7 +579,7 @@ void ptx_instruction::set_fp_or_int_archop() {
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
       m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
-      m_opcode == MBARRIER_OP) return;
+      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP) return;
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
@@ -607,7 +607,7 @@ void ptx_instruction::set_mul_div_or_other_archop() {
   if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
       m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
       m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
-      m_opcode == MBARRIER_OP) return;
+      m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP) return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
       (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
@@ -1042,6 +1042,9 @@ void ptx_instruction::set_opcode_and_latency() {
     case MBARRIER_OP:
       op = SYNCS_OP;
       break;
+    case TMA_PTX_OP:
+      op = TMA_OP;
+      break;
     default:
       break;
   }
@@ -1190,10 +1193,30 @@ void ptx_instruction::pre_decode() {
   ptx_instruction::const_iterator opr = op_iter_begin();
   for (; opr != op_iter_end(); opr++, n++) {  // process operands
     const operand_info &o = *opr;
+    if (m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP) {
+      const bool output = m_opcode == MBARRIER_OP && n == 0 &&
+          (ptx_mbarrier.kind == ptx_mbarrier_op::ARRIVE ||
+           ptx_mbarrier.kind == ptx_mbarrier_op::ARRIVE_DROP ||
+           ptx_mbarrier.kind == ptx_mbarrier_op::TEST_WAIT ||
+           ptx_mbarrier.kind == ptx_mbarrier_op::TRY_WAIT ||
+           ptx_mbarrier.kind == ptx_mbarrier_op::PENDING_COUNT);
+      const auto input = [&](const symbol *symbol) {
+        if (!symbol || !symbol->is_reg() || symbol->name() == "_") return;
+        if (m >= MAX_INPUT_VALUES) throw std::runtime_error("PTX Hopper input register limit exceeded");
+        operand_info reg(symbol, gpgpu_ctx);
+        in[m] = reg.reg_num(); arch_reg.src[m] = reg.arch_reg_num(); ++m;
+      };
+      if (output && o.is_reg() && !o.is_non_arch_reg()) {
+        out[0] = o.reg_num(); arch_reg.dst[0] = o.arch_reg_num();
+      } else if (o.is_vector()) {
+        for (unsigned v = 0; v < o.get_vect_nelem(); ++v) input(o.vec_symbol(v));
+      } else if (o.is_reg() || o.is_memory_operand()) input(o.get_symbol());
+      continue;
+    }
     if (m_opcode == LDMATRIX_OP || m_opcode == MMA_SYNC_OP ||
         m_opcode == WGMMA_MMA_OP || m_opcode == WGMMA_FENCE_OP ||
         m_opcode == WGMMA_COMMIT_OP || m_opcode == WGMMA_WAIT_OP ||
-        m_opcode == MBARRIER_OP)
+        m_opcode == MBARRIER_OP || m_opcode == TMA_PTX_OP)
       continue;
     if (has_dst && n == 0) {
       // Do not set the null register "_" as an architectural register
@@ -1912,6 +1935,71 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       delete pJ;
       pI = pI_saved;
 
+      if (inst_opcode == TMA_PTX_OP && pI->ptx_tma.kind == ptx_tma_op::LOAD) {
+        inst.space = global_space;
+        inst.memory_op = memory_load;
+        inst.cache_op = CACHE_GLOBAL;
+        inst.ptx_tma_completion = m_last_tma_completion;
+        if (!isInFunctionalSimulationMode() && inst.ptx_tma_completion && lane_id != 0)
+          throw std::runtime_error("PTX detailed TMA requires a single lane-0 issuer");
+        inst.data_size = m_last_tma_transfer.element_bytes;
+        std::vector<new_addr_type> addresses;
+        for (size_t e = 0; e < m_last_tma_transfer.addresses.size(); ++e)
+          if (m_last_tma_transfer.in_bounds[e])
+            addresses.push_back(m_last_tma_transfer.addresses[e]);
+        inst.set_tma_access_addrs(addresses);
+        inst.set_tma_byte_count(m_last_tma_transfer.bytes - m_last_tma_transfer.oob_bytes);
+        inst.set_tma_oob_byte_count(m_last_tma_transfer.oob_bytes);
+        inst.set_tma_mbar_addr(m_last_tma_bar);
+        inst.set_tma_multicast(pI->ptx_tma.multicast);
+        inst.set_tma_multicast_cta_mask(m_last_tma_mask);
+        m_gpu->last_ptx_tma_metadata = {
+            std::vector<uint64_t>(addresses.begin(), addresses.end()), inst.data_size,
+            inst.get_tma_byte_count(), inst.get_tma_oob_byte_count(),
+            inst.get_tma_mbar_addr(), inst.get_tma_multicast_cta_mask()};
+      }
+
+      if (!isInFunctionalSimulationMode() &&
+          (inst_opcode == MBARRIER_OP || inst_opcode == TMA_PTX_OP)) {
+        const dim3 cta_id = get_ctaid(), grid = get_kernel().get_grid_dim();
+        auto binding = m_gpu->get_ptx_tma_cta(get_kernel().get_uid(),
+            cta_id.x + grid.x * (cta_id.y + grid.y * cta_id.z));
+        inst.set_cuda_cta_id(cta_id);
+        inst.set_cuda_cluster_id(dim3(binding->cluster, 0, 0));
+        inst.set_cuda_cluster_rank(binding->rank);
+        if (inst_opcode == MBARRIER_OP) {
+          auto operands = inst.get_syncs_operand();
+          const auto kind = pI->ptx_mbarrier.kind;
+          unsigned address_pos = (kind == ptx_mbarrier_op::INIT ||
+              kind == ptx_mbarrier_op::INVALIDATE || kind == ptx_mbarrier_op::EXPECT_TX ||
+              kind == ptx_mbarrier_op::COMPLETE_TX) ? 0 : 1;
+          const auto &address = pI->operand_lookup(address_pos);
+          uint32_t offset = get_operand_value(address, address, B64_TYPE, this, 0).u64;
+          operands.addr[lane_id] = (binding->rank << 24) | offset;
+          const auto value = [&](unsigned n) {
+            return get_operand_value(pI->operand_lookup(n), pI->dst(), U32_TYPE, this, 0).u32;
+          };
+          switch (kind) {
+            case ptx_mbarrier_op::INIT: operands.u.init.count[lane_id] = value(1); break;
+            case ptx_mbarrier_op::EXPECT_TX: operands.u.expect_tx.txCount[lane_id] = value(1); break;
+            case ptx_mbarrier_op::COMPLETE_TX: operands.u.complete_tx.txCount[lane_id] = value(1); break;
+            case ptx_mbarrier_op::ARRIVE:
+            case ptx_mbarrier_op::ARRIVE_DROP:
+              operands.u.arrive.count[lane_id] =
+                  pI->get_syncs_op() == SYNCS_ARRIVE_EXPECT_TX || pI->get_num_operands() == 2 ? 1 : value(2);
+              operands.u.arrive.txCount[lane_id] = pI->get_syncs_op() == SYNCS_ARRIVE_EXPECT_TX ? value(2) : 0;
+              break;
+            case ptx_mbarrier_op::TEST_WAIT:
+            case ptx_mbarrier_op::TRY_WAIT:
+              operands.u.wait.phase[lane_id] = value(2);
+              operands.wait_parity[lane_id] = pI->ptx_mbarrier.parity;
+              break;
+            default: break;
+          }
+          inst.set_syncs_operand(operands);
+        }
+      }
+
       // Run exit instruction if exit option included
       if (pI->is_exit()) exit_impl(pI, this);
     }
@@ -1950,7 +2038,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     unsigned insn_data_size = 0;
     if ((pI->has_memory_read() || pI->has_memory_write())) {
       if (!(inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP ||
-            inst_opcode == LDMATRIX_OP)) {
+            inst_opcode == LDMATRIX_OP || inst_opcode == TMA_PTX_OP)) {
         insn_memaddr = last_eaddr();
         insn_space = last_space();
         unsigned to_type = pI->get_type();
@@ -2062,7 +2150,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     // "Return values"
     if (!skip) {
       if (!(inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP ||
-            inst_opcode == LDMATRIX_OP)) {
+            inst_opcode == LDMATRIX_OP || inst_opcode == TMA_PTX_OP)) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);
         inst.data_size = insn_data_size;  // simpleAtomicIntrinsics
@@ -2089,6 +2177,7 @@ const struct gpgpu_ptx_sim_info *ptx_sim_kernel_info(
 
 const warp_inst_t *gpgpu_context::ptx_fetch_inst(address_type pc) {
   const ptx_instruction *inst = pc_to_instruction(pc);
+  if (!inst) return nullptr;
   if (inst->ptx_matrix.kind != ptx_matrix_metadata::NONE &&
       !inst->ptx_matrix.timing_supported) {
     fprintf(stderr, "%s:%u: PTX matrix timing is not implemented: %s\n",
@@ -2725,7 +2814,13 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
       someOneLive = false;
       break;
     }
-    if (!someOneLive) break;
+    if (!someOneLive) {
+      if (m_thread[0]->m_cta_info->tma_has_pending()) {
+        fprintf(stderr, "PTX TMA functional CTA exited with uncompleted transfers\n");
+        abort();
+      }
+      break;
+    }
     if (allAtBarrier) {
       for (unsigned i = 0; i < m_warp_count; i++) m_warpAtBarrier[i] = false;
     }

@@ -88,6 +88,7 @@ wmma\.store 	TC; yylval->int_value = MMA_ST_OP; return OPCODE;
 
 (ldmatrix|mma|wgmma)(\.[a-zA-Z0-9_:]+)+ TC; yylval->string_value = strdup(yytext); return MATRIX_OPCODE;
 mbarrier(\.[a-zA-Z0-9_:]+)+ TC; yylval->string_value = strdup(yytext); return MBARRIER_OPCODE;
+cp(\.[a-zA-Z0-9_:]+)+ TC; yylval->string_value = strdup(yytext); return TMA_OPCODE;
 
 call	TC; BEGIN(NOT_OPCODE); yylval->int_value = CALL_OP; return OPCODE; // blocking opcode token in case the callee has the same name as an opcode
 callp   TC; BEGIN(NOT_OPCODE); yylval->int_value = CALLP_OP; return OPCODE;

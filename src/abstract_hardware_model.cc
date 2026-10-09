@@ -294,6 +294,28 @@ void warp_inst_t::generate_mem_accesses() {
 
   const size_t starting_queue_size = m_accessq.size();
 
+  if (ptx_tma_completion) {
+    std::map<new_addr_type, transaction_info> sectors;
+    for (size_t e = 0; e < ptx_tma_completion->transfer.addresses.size(); ++e) {
+      if (!ptx_tma_completion->transfer.in_bounds[e]) continue;
+      for (unsigned b = 0; b < data_size; ++b) {
+        new_addr_type address = ptx_tma_completion->transfer.addresses[e] + b;
+        auto &info = sectors[address & ~new_addr_type(31)];
+        info.active = m_warp_active_mask;
+        info.bytes.set(address & 127);
+        info.chunks.set((address & 127) / 32);
+      }
+    }
+    for (const auto &sector : sectors)
+      m_accessq.push_back(mem_access_t(GLOBAL_ACC_R, sector.first, 32, false,
+          sector.second.active, sector.second.bytes, sector.second.chunks,
+          m_config->gpgpu_ctx, true, get_tma_mbar_addr(), is_tma_multicast(),
+          get_tma_multicast_cta_mask(), get_cuda_cta_id(), get_cuda_cluster_id(),
+          get_cuda_cluster_rank()));
+    m_mem_accesses_created = true;
+    return;
+  }
+
   assert(is_load() || is_store());
 
   // if((space.get_type() != tex_space) && (space.get_type() != const_space))

@@ -201,6 +201,17 @@ struct ptx_mbarrier_metadata {
   bool functional_supported = false;
   bool timing_supported = false;
 };
+
+enum class ptx_tma_op { NONE, LOAD, PREFETCH };
+
+struct ptx_tma_metadata {
+  ptx_tma_op kind = ptx_tma_op::NONE;
+  std::string opcode;
+  unsigned rank = 0;
+  bool multicast = false;
+  bool functional_supported = false;
+  bool timing_supported = false;
+};
 typedef enum uarch_op_t op_type;
 
 enum uarch_bar_t { NOT_BAR = -1, SYNC = 1, ARRIVE, RED };
@@ -952,6 +963,8 @@ class gpgpu_functional_sim_config {
   unsigned m_texcache_linesize;
 };
 
+#include "cuda-sim/tma.h"
+
 class gpgpu_t {
  public:
   gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx);
@@ -978,6 +991,34 @@ class gpgpu_t {
   void memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count);
 
   class memory_space *get_global_memory() { return m_global_mem; }
+  void register_ptx_tma_descriptor(uint64_t address, const ptx_tma_descriptor &descriptor) {
+    ptx_tma_descriptors[address] = descriptor;
+  }
+  const ptx_tma_descriptor &get_ptx_tma_descriptor(uint64_t address) const {
+    auto it = ptx_tma_descriptors.find(address);
+    if (it == ptx_tma_descriptors.end())
+      throw std::runtime_error("TMA descriptor address is not registered");
+    return it->second;
+  }
+  ptx_tma_statistics ptx_tma_stats;
+  ptx_tma_dynamic_metadata last_ptx_tma_metadata;
+  std::vector<std::shared_ptr<ptx_tma_cta_binding>> ptx_tma_ctas;
+  void register_ptx_tma_cta(const ptx_tma_cta_binding &binding) {
+    if (binding.rank >= 16 || !binding.capacity || binding.barrier_offset % 8 ||
+        binding.shared_address % 16 || binding.started)
+      throw std::runtime_error("invalid PTX TMA target registration");
+    for (const auto &other : ptx_tma_ctas)
+      if (other->kernel == binding.kernel &&
+          (other->cta == binding.cta ||
+           (other->cluster == binding.cluster && other->rank == binding.rank)))
+        throw std::runtime_error("duplicate PTX TMA target registration");
+    ptx_tma_ctas.push_back(std::make_shared<ptx_tma_cta_binding>(binding));
+  }
+  std::shared_ptr<ptx_tma_cta_binding> get_ptx_tma_cta(uint64_t kernel, unsigned cta) {
+    for (auto &binding : ptx_tma_ctas)
+      if (binding->kernel == kernel && binding->cta == cta) return binding;
+    throw std::runtime_error("PTX TMA CTA identity is not registered");
+  }
   class memory_space *get_tex_memory() { return m_tex_mem; }
   class memory_space *get_surf_memory() { return m_surf_mem; }
 
@@ -1041,6 +1082,7 @@ class gpgpu_t {
   FILE *ptx_inst_debug_file;
 
   class memory_space *m_global_mem;
+  std::map<uint64_t, ptx_tma_descriptor> ptx_tma_descriptors;
   class memory_space *m_tex_mem;
   class memory_space *m_surf_mem;
 
@@ -1458,6 +1500,7 @@ class inst_t {
   address_type pc;  // program counter address of instruction
   ptx_matrix_metadata ptx_matrix;
   ptx_mbarrier_metadata ptx_mbarrier;
+  ptx_tma_metadata ptx_tma;
   unsigned isize;   // size of instruction in bytes
   op_type op;       // opcode (uarch visible)
 
@@ -1527,6 +1570,7 @@ class warp_inst_t : public inst_t {
   // TODO Weili Oct, 8 2025: Fields unique to certain type of instructions
   // TODO should be grouped under a union to reduce memory usage
  public:
+  std::shared_ptr<ptx_tma_completion_record> ptx_tma_completion;
   // constructors
   warp_inst_t() {
     m_uid = 0;

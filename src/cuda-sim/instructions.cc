@@ -36,6 +36,7 @@
 #include "opcodes.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
+#include "tma.h"
 typedef void *yyscan_t;
 class ptx_recognizer;
 #include <assert.h>
@@ -193,6 +194,50 @@ void mbarrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
                                      U32_TYPE, thread, 0)
         .u32;
   };
+  if (!thread->isInFunctionalSimulationMode()) {
+    if (cluster) throw std::runtime_error("PTX detailed cluster-addressed mbarrier is not implemented");
+    if (bar_addr > 0xffffff) throw std::runtime_error("PTX mbarrier offset exceeds 24 bits");
+    auto *gpu = thread->get_gpu();
+    const dim3 cta_id = thread->get_ctaid();
+    const dim3 grid = thread->get_kernel().get_grid_dim();
+    auto binding = gpu->get_ptx_tma_cta(thread->get_kernel().get_uid(),
+        cta_id.x + grid.x * (cta_id.y + grid.y * cta_id.z));
+    const uint32_t address = (binding->rank << 24) | bar_addr;
+    auto &table = thread->get_kernel().get_cluster_mbarrier_lookup_table(dim3(binding->cluster, 0, 0));
+    auto *bar = table.lookup_clustermbar_allow_nonexist(address);
+    if (kind == ptx_mbarrier_op::INIT) {
+      if (bar_addr != binding->barrier_offset)
+        throw std::runtime_error("PTX TMA barrier offset mismatch at initialization");
+      memory_space *shared = thread->m_shared_mem;
+      const size_t capacity = binding->capacity;
+      const uint32_t shared_address = binding->shared_address;
+      binding->write = [=](size_t offset, const void *data, size_t bytes) {
+        if (offset > capacity || bytes > capacity - offset)
+          throw std::runtime_error("PTX TMA target capacity exceeded");
+        shared->write(shared_address + offset, bytes, data, thread, pI);
+      };
+      return;
+    }
+    if (!bar) throw std::runtime_error("PTX detailed mbarrier used before initialization writeback");
+    ptx_reg_t result;
+    if (kind == ptx_mbarrier_op::TEST_WAIT || kind == ptx_mbarrier_op::TRY_WAIT) {
+      const bool complete = bar->test_wait(value(2), pI->ptx_mbarrier.parity);
+      if (complete) ++gpu->ptx_tma_stats.wait_success;
+      else ++gpu->ptx_tma_stats.wait_failure;
+      result.pred = complete ? 0 : 1;
+      thread->set_operand_value(pI->dst(), result, PRED_TYPE, thread, pI);
+      printf("TMA_DETAIL event=wait cycle=%llu cta=%u rank=%u barrier=%x success=%u tx=%d phase=%d\n",
+          gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle, binding->cta, binding->rank,
+          address, complete, bar->get_tx_count(), bar->get_phase());
+    } else if (kind == ptx_mbarrier_op::ARRIVE || kind == ptx_mbarrier_op::ARRIVE_DROP) {
+      result.u64 = bar->get_phase();
+      if (pI->dst().is_reg()) thread->set_operand_value(pI->dst(), result, B64_TYPE, thread, pI);
+    } else if (kind == ptx_mbarrier_op::PENDING_COUNT) {
+      result.u32 = bar->get_pending_thread_count();
+      thread->set_operand_value(pI->dst(), result, U32_TYPE, thread, pI);
+    }
+    return; // State transitions occur at SYNCS writeback, never PTX execution.
+  }
   ptx_reg_t result;
   switch (kind) {
     case ptx_mbarrier_op::INIT:
@@ -229,9 +274,15 @@ void mbarrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     case ptx_mbarrier_op::TEST_WAIT:
     case ptx_mbarrier_op::TRY_WAIT: {
+      // Functional asynchronous engine: a try-wait is a progress point. A
+      // test-wait only observes state and never completes queued transfers.
+      if (kind == ptx_mbarrier_op::TRY_WAIT) thread->m_cta_info->tma_progress();
       const bool complete = thread->m_cta_info->mbarrier_test_wait(
           bar_addr, value(2), pI->ptx_mbarrier.parity);
-      result.pred = complete ? 1 : 0;
+      if (complete) ++thread->get_gpu()->ptx_tma_stats.wait_success;
+      else ++thread->get_gpu()->ptx_tma_stats.wait_failure;
+      // Predicate registers store the PTXplus zero flag: zero means true.
+      result.pred = complete ? 0 : 1;
       thread->set_operand_value(pI->dst(), result, PRED_TYPE, thread, pI);
       return;
     }
@@ -243,6 +294,134 @@ void mbarrier_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       fprintf(stderr, "%s:%u: unsupported mbarrier operation\n",
               pI->source_file(), pI->source_line());
       abort();
+  }
+}
+
+void tma_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  try {
+    const bool prefetch = pI->ptx_tma.kind == ptx_tma_op::PREFETCH;
+    const operand_info &destination = pI->operand_lookup(0);
+    const operand_info &descriptor = pI->operand_lookup(prefetch ? 0 : 1);
+    const operand_info &coordinates = pI->operand_lookup(prefetch ? 1 : 2);
+    addr_t descriptor_address = thread->get_operand_value(
+        descriptor, destination, B64_TYPE, thread, 0).u64;
+    std::array<int32_t, 5> coordinate_values{};
+    const unsigned rank = pI->ptx_tma.rank;
+    for (unsigned r = 0; r < rank; ++r)
+      coordinate_values[r] = thread->get_operand_value(
+          operand_info(coordinates.vec_symbol(r), thread->get_gpu()->gpgpu_ctx), destination,
+          U32_TYPE, thread, 0).u32;
+    const ptx_tma_descriptor &logical =
+        thread->get_gpu()->get_ptx_tma_descriptor(descriptor_address);
+    ptx_tma_transfer transfer = ptx_tma_expand(logical, rank, coordinate_values);
+    if (prefetch) {
+      if (!thread->isInFunctionalSimulationMode())
+        throw std::runtime_error("PTX detailed TMA prefetch timing is not implemented");
+      ++thread->get_gpu()->ptx_tma_stats.prefetch;
+      return;  // Validated hint; no functional write or barrier event.
+    }
+    const operand_info &barrier = pI->operand_lookup(3);
+    addr_t destination_address = thread->get_operand_value(
+        destination, destination, B64_TYPE, thread, 0).u64;
+    addr_t barrier_address = thread->get_operand_value(
+        barrier, destination, B64_TYPE, thread, 0).u64;
+    uint32_t mask = 1;
+    if (pI->ptx_tma.multicast) {
+      mask = thread->get_operand_value(pI->operand_lookup(4), destination,
+                                        U32_TYPE, thread, 0).u32;
+      if (thread->isInFunctionalSimulationMode() && mask != 1)
+        throw std::runtime_error("PTX multicast requires concurrent CTA targets; only local mask=1 is supported");
+    }
+    if (destination_address % 16 || barrier_address % 8 ||
+        destination_address > 0xffffffffULL - transfer.bytes ||
+        barrier_address > 0xffffffffULL)
+      throw std::runtime_error("invalid TMA shared destination or mbarrier address");
+    thread->m_last_tma_transfer = transfer;
+    thread->m_last_tma_bar = barrier_address;
+    thread->m_last_tma_mask = mask;
+    if (!thread->isInFunctionalSimulationMode()) {
+      if (rank > 2) throw std::runtime_error("PTX detailed TMA supports only 1D/2D tiled loads");
+      auto *gpu = thread->get_gpu();
+      const dim3 cta_id = thread->get_ctaid(), grid = thread->get_kernel().get_grid_dim();
+      auto source = gpu->get_ptx_tma_cta(thread->get_kernel().get_uid(),
+          cta_id.x + grid.x * (cta_id.y + grid.y * cta_id.z));
+      if (!pI->ptx_tma.multicast) mask = 1u << source->rank;
+      auto record = std::make_shared<ptx_tma_completion_record>();
+      record->transfer = transfer;
+      record->mask = mask;
+      record->source_rank = source->rank;
+      record->data.assign(transfer.bytes, 0);
+      uint32_t found = 0;
+      if (!mask || (mask & ~0xffffu)) throw std::runtime_error("PTX TMA empty or invalid multicast mask");
+      for (auto &target : gpu->ptx_tma_ctas) {
+        if (target->kernel != source->kernel || target->cluster != source->cluster ||
+            !(mask & (1u << target->rank))) continue;
+        if (!target->started || !target->write || !target->complete || !target->transaction_count)
+          throw std::runtime_error("PTX TMA target CTA has not started/initialized");
+        if (target->barrier_offset != barrier_address ||
+            target->shared_address != destination_address || target->capacity < transfer.bytes)
+          throw std::runtime_error("PTX TMA target barrier offset/shared layout mismatch");
+        if (target->transaction_count() < int(transfer.bytes))
+          throw std::runtime_error("PTX TMA target transaction expectation is insufficient");
+        found |= 1u << target->rank;
+        record->targets.push_back(target);
+      }
+      if (found != mask) throw std::runtime_error("PTX TMA unknown multicast rank/target");
+      // Distinct tile positions may not alias the same source bytes in this first detailed model.
+      std::set<uint64_t> addresses;
+      for (size_t e = 0; e < transfer.addresses.size(); ++e) {
+        if (!transfer.in_bounds[e]) continue;
+        if (transfer.addresses[e] % transfer.element_bytes)
+          throw std::runtime_error("PTX detailed TMA requires naturally aligned elements");
+        for (unsigned b = 0; b < transfer.element_bytes; ++b)
+          if (!addresses.insert(transfer.addresses[e] + b).second)
+            throw std::runtime_error("PTX detailed TMA overlapping descriptor strides");
+      }
+      memory_space *global = thread->get_global_memory();
+      record->read = [=](uint64_t address, void *data, size_t bytes) { global->read(address, bytes, data); };
+      const auto targets = record->targets;
+      record->event = [=](const char *event, unsigned target_rank, size_t bytes) {
+        unsigned target_cta = source->cta;
+        for (const auto &target : targets)
+          if (target->rank == target_rank) target_cta = target->cta;
+        printf("TMA_DETAIL event=%s cycle=%llu cta=%u rank=%u source_rank=%u barrier=%llx mask=%x bytes=%zu\n",
+            event, gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle, target_cta, target_rank,
+            source->rank, (unsigned long long)barrier_address, mask, bytes);
+      };
+      thread->m_last_tma_completion = record;
+      thread->m_last_tma_bar = (source->rank << 24) | barrier_address;
+      thread->m_last_tma_mask = mask;
+      return;
+    }
+    memory_space *shared = thread->m_shared_mem;
+    memory_space *global = thread->get_global_memory();
+    ptx_cta_info *cta = thread->m_cta_info;
+    ptx_tma_statistics *stats = &thread->get_gpu()->ptx_tma_stats;
+    ++stats->issue;
+    stats->oob_bytes += transfer.oob_bytes;
+    std::vector<ptx_tma_target> targets{{0,
+        [=](size_t offset, const void *data, size_t bytes) {
+          shared->write(destination_address + offset, bytes, data, thread, pI);
+          ++stats->shared_writes;
+          stats->shared_bytes += bytes;
+        },
+        [=](size_t bytes) {
+          cta->mbarrier_complete_tx(barrier_address, bytes);
+          ++stats->completion;
+        }}};
+    cta->tma_submit([=]() {
+      ptx_tma_complete(transfer, mask, targets,
+          [=](uint64_t address, void *data, size_t bytes) {
+            global->read(address, bytes, data);
+            ++stats->global_reads;
+            stats->global_bytes += bytes;
+          });
+    });
+  } catch (const std::exception &error) {
+    const dim3 cta = thread->get_ctaid();
+    fprintf(stderr, "%s:%u: CTA=(%u,%u,%u) %s\n", pI->source_file(),
+        pI->source_line(), cta.x, cta.y, cta.z, error.what());
+    abort();
   }
 }
 

@@ -355,6 +355,7 @@ class shd_warp_t {
     m_stores_outstanding--;
   }
 
+  bool m_ptx_sync_pending = false;
   bool tma_loads_done() const { return m_tma_loads_outstanding == 0; }
   void inc_tma_load_req() { m_tma_loads_outstanding++; }
   void dec_tma_load_req() {
@@ -1867,6 +1868,8 @@ class ldst_unit : public pipelined_simd_unit {
    */
   void mbarrier_init(ClusterCTAIdentifier cluster_cta_identifier, dim3 cta_id,
                      unsigned thread_idx, const syncs_operand &operand);
+  void ptx_tma_finish(const std::shared_ptr<ptx_tma_completion_record> &record);
+  void ptx_tma_response(mem_fetch *mf);
 
   /**
    * @brief Invalidate a mbarrier

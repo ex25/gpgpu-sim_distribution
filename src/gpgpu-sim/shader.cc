@@ -1069,6 +1069,8 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
+  if ((*pipe_reg)->ptx_mbarrier.kind != ptx_mbarrier_op::NONE)
+    m_warp[warp_id]->m_ptx_sync_pending = true;
 
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
@@ -1272,6 +1274,9 @@ bool shader_core_ctx::check_trywait_ready(const warp_inst_t *pI,
   // Check if TRYWAIT can proceed (mbarrier acquired for all active lanes)
   // Called from scheduler before issue_warp() to avoid ibuffer complications
   // Also sets the final acquired state so issue_warp() doesn't need to
+  // PTX try_wait is a predicate operation. The PTX loop retries explicitly;
+  // static instruction operands cannot represent its dynamic register addresses.
+  if (pI->ptx_mbarrier.kind != ptx_mbarrier_op::NONE) return true;
   unsigned max_retries = m_config->gpgpu_trywait_max_retries;
   unsigned retry_cycles = m_config->gpgpu_trywait_retry_cycles;
   bool all_acquired = true;
@@ -2538,7 +2543,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
       if (inst.accessq_empty()) {
         break;
       }
-      const mem_access_t &access = inst.accessq_back();
+      const mem_access_t access = inst.accessq_back();
       unsigned size = access.get_size() + control_size;
       // printf("Interconnect:Addr: %x, size=%d\n",access.get_addr(),size);
       if (m_memory_config->SST_mode &&
@@ -2565,6 +2570,12 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
                                       m_core->get_gpu()->gpu_tot_sim_cycle);
         m_icnt->push(mf);
         inst.accessq_pop_back();
+        if (inst.ptx_tma_completion) {
+          ++m_core->get_gpu()->ptx_tma_stats.global_requests;
+          ++inst.ptx_tma_completion->global_requests;
+          inst.ptx_tma_completion->event("global_request",
+              inst.ptx_tma_completion->source_rank, access.get_byte_mask().count());
+        }
         // inst.clear_active( access.get_warp_mask() );
         if (inst.is_load()) {
           for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
@@ -2952,7 +2963,25 @@ void ldst_unit::issue(register_set &reg_set) {
   inst->op_pipe = MEM__OP;
 
   // Update TMA oob byte count
-  if (inst->is_tma_load()) {
+  if (inst->ptx_tma_completion) {
+    auto record = inst->ptx_tma_completion;
+    if (record->issued) throw std::runtime_error("PTX TMA record issued twice");
+    record->issued = true;
+    auto &stats = m_core->get_gpu()->ptx_tma_stats;
+    ++stats.detailed_issue;
+    ++stats.issue;
+    stats.oob_bytes += record->transfer.oob_bytes;
+    record->event("issue", record->source_rank, record->transfer.bytes);
+    if (record->transfer.bytes == record->transfer.oob_bytes) {
+      ptx_tma_finish(record);
+    } else if (record->transfer.oob_bytes) {
+      for (auto &target : record->targets) {
+        target->complete(record->transfer.oob_bytes);
+        ++stats.oob_completions;
+        record->event("oob_complete", target->rank, record->transfer.oob_bytes);
+      }
+    }
+  } else if (inst->is_tma_load()) {
     if (inst->get_tma_oob_byte_count() > 0) {
       // If this TMA load is accessing oob, we need to update the mbarrier
       // counter properly ideally this should be done in the ::writeback()
@@ -2977,6 +3006,15 @@ void ldst_unit::issue(register_set &reg_set) {
 }
 
 bool ldst_unit::writeback_complete(warp_inst_t &inst) {
+  if (inst.ptx_tma_completion) {
+    m_scoreboard->releaseRegisters(&inst);
+    return true;
+  }
+  if (inst.ptx_mbarrier.kind != ptx_mbarrier_op::NONE) {
+    m_scoreboard->releaseRegisters(&inst);
+    m_core->warp_inst_complete(inst);
+    return true;
+  }
   bool insn_completed = false;
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst.out[r] > 0) {
@@ -3019,6 +3057,59 @@ bool ldst_unit::writeback_complete(warp_inst_t &inst) {
     }
   }
   return insn_completed;
+}
+
+void ldst_unit::ptx_tma_finish(const std::shared_ptr<ptx_tma_completion_record> &record) {
+  if (record->finished) throw std::runtime_error("PTX TMA completion published twice");
+  auto &stats = m_core->get_gpu()->ptx_tma_stats;
+  // Validate every target before publishing any data.
+  const size_t remaining = record->transfer.bytes - record->transfer.oob_bytes;
+  const size_t complete_bytes = remaining ? remaining : record->transfer.bytes;
+  for (auto &target : record->targets)
+    if (!target->started || !target->write || !target->complete ||
+        target->transaction_count() < int(complete_bytes))
+      throw std::runtime_error("PTX TMA target disappeared or transaction count mismatch at writeback");
+  for (auto &target : record->targets) {
+    target->write(0, record->data.data(), record->data.size());
+    ++stats.shared_writes;
+    stats.shared_bytes += record->transfer.bytes;
+    record->event("shared_write", target->rank, record->transfer.bytes);
+  }
+  for (auto &target : record->targets) {
+    target->complete(complete_bytes);
+    ++stats.completion;
+    if (remaining) ++stats.in_bounds_completions;
+    else ++stats.oob_completions;
+    record->event("completion", target->rank, complete_bytes);
+  }
+  record->finished = true;
+}
+
+void ldst_unit::ptx_tma_response(mem_fetch *mf) {
+  auto record = mf->get_inst().ptx_tma_completion;
+  const auto &access = mf->get_mem_access();
+  if (!record || !record->issued || record->finished)
+    throw std::runtime_error("invalid PTX TMA response record");
+  auto &stats = m_core->get_gpu()->ptx_tma_stats;
+  ++stats.global_responses;
+  record->event("global_response", record->source_rank, access.get_byte_mask().count());
+  size_t bytes = 0;
+  for (size_t e = 0; e < record->transfer.addresses.size(); ++e) {
+    if (!record->transfer.in_bounds[e]) continue;
+    uint64_t address = record->transfer.addresses[e];
+    if (address < access.get_addr() || address >= access.get_addr() + access.get_size()) continue;
+    if (!record->returned_addresses.insert(address).second)
+      throw std::runtime_error("PTX TMA element returned twice");
+    record->read(address, &record->data[e * record->transfer.element_bytes], record->transfer.element_bytes);
+    bytes += record->transfer.element_bytes;
+    ++stats.global_reads;
+  }
+  if (bytes != access.get_byte_mask().count())
+    throw std::runtime_error("PTX TMA response exact-byte mask mismatch");
+  record->returned_bytes += bytes;
+  stats.global_bytes += bytes;
+  if (record->returned_bytes == record->transfer.bytes - record->transfer.oob_bytes)
+    ptx_tma_finish(record);
 }
 
 void ldst_unit::writeback() {
@@ -3085,7 +3176,14 @@ void ldst_unit::writeback() {
             }
             // Update TMA mbarrier state as this load returns
             const mem_access_t &access = mf->get_mem_access();
-            if (access.is_tma() && !access.is_write()) {
+            if (m_next_wb.ptx_tma_completion) {
+              ptx_tma_response(mf);
+              if (m_next_wb.ptx_tma_completion->finished) {
+                for (unsigned n = 0; n < m_next_wb.ptx_tma_completion->global_requests; ++n)
+                  m_core->dec_tma_load_req(mf->get_wid());
+                m_core->warp_inst_complete(m_next_wb);
+              }
+            } else if (access.is_tma() && !access.is_write()) {
               // TMA load from global returns: complete the mbarrier by the
               // number of in-bounds bytes this access actually covers, NOT the
               // sector-rounded access size. The coalescer rounds an access up
@@ -3316,6 +3414,8 @@ void ldst_unit::writeback() {
               assert(false && "Unsupported syncs opcode");
           }
 
+          if (syncs_inst->ptx_mbarrier.kind != ptx_mbarrier_op::NONE)
+            m_core->get_warp_nonconst(syncs_inst->warp_id())->m_ptx_sync_pending = false;
           // Wrapping off syncs instruction
           m_next_wb = *m_pipeline_reg[0];
           m_core->dec_inst_in_pipeline(m_pipeline_reg[0]->warp_id());
@@ -3582,7 +3682,7 @@ void ldst_unit::cycle() {
             }
           }
         }
-        if (!pending_requests) {
+        if (!pending_requests && !pipe_reg.ptx_tma_completion) {
           m_core->warp_inst_complete(*m_dispatch_reg);
           m_scoreboard->releaseRegisters(m_dispatch_reg);
 
@@ -3602,6 +3702,9 @@ void ldst_unit::cycle() {
             }
           }
         }
+        if (pipe_reg.ptx_tma_completion && pipe_reg.ptx_tma_completion->finished &&
+            pipe_reg.ptx_tma_completion->transfer.bytes == pipe_reg.ptx_tma_completion->transfer.oob_bytes)
+          m_core->warp_inst_complete(pipe_reg);
         m_core->dec_inst_in_pipeline(warp_id);
         m_dispatch_reg->clear();
       }
@@ -3741,7 +3844,20 @@ void ldst_unit::mbarrier_init(ClusterCTAIdentifier cluster_cta_identifier,
   // Get the cluster mbarrier lookup table
   ClusterMbarriersLookupTable &mbarrier_table =
       get_mbarrier_table(cluster_cta_identifier.cluster_id);
+  mbarrier_t *registered = mbarrier.get();
   mbarrier_table.insert_mbarrier(std::move(mbarrier));
+  auto *gpu = m_core->get_gpu();
+  for (auto &binding : gpu->ptx_tma_ctas) {
+    if (binding->kernel != m_core->get_kernel_info()->get_uid() ||
+        binding->cluster != cluster_cta_identifier.cluster_id.x ||
+        binding->rank != cluster_cta_identifier.cluster_rank) continue;
+    if (!binding->write || binding->barrier_offset != registered->get_bar_offset())
+      throw std::runtime_error("PTX TMA target writer/barrier registration mismatch");
+    binding->complete = [registered](size_t bytes) { registered->complete_on(bytes); };
+    binding->transaction_count = [registered]() { return registered->get_tx_count(); };
+    binding->started = true;
+  }
+
 }
 
 void ldst_unit::mbarrier_invalidate(ClusterCTAIdentifier cluster_cta_identifier,
@@ -5027,6 +5143,7 @@ bool shd_warp_t::waiting() {
   waiting |= m_shader->warp_waiting_at_barrier(m_warp_id);
   // waiting for memory barrier
   waiting |= m_shader->warp_waiting_at_mem_barrier(m_warp_id);
+  waiting |= m_ptx_sync_pending;
   // waiting for atomic operation to complete at memory:
   // this stall is not required for accurate timing model, but rather we
   // stall here since if a call/return instruction occurs in the meantime

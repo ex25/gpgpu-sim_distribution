@@ -99,6 +99,7 @@ void ptx_recognizer::init_instruction_state() {
   g_vector_operands.clear();
   g_matrix_opcode.clear();
   g_mbarrier_opcode.clear();
+  g_tma_opcode.clear();
   g_return_var = operand_info(gpgpu_ctx);
   init_directive_state();
 }
@@ -271,6 +272,7 @@ const ptx_instruction *ptx_recognizer::ptx_instruction_lookup(
 void ptx_recognizer::add_instruction() {
   validate_matrix_operands();
   validate_mbarrier_operands();
+  validate_tma_operands();
   PTX_PARSE_DPRINTF("add_instruction: %s",
                     ((g_opcode > 0) ? g_opcode_string[g_opcode] : "<label>"));
   assert(g_shader_core_config != 0);
@@ -349,6 +351,18 @@ void ptx_recognizer::add_instruction() {
         i->set_syncs_op(SYNCS_PENDING_COUNT); break;
       default: break;
     }
+  }
+  if (!g_tma_opcode.empty()) {
+    i->ptx_tma.opcode = g_tma_opcode;
+    i->ptx_tma.functional_supported = true;
+    if (g_tma_opcode.find(".prefetch.") != std::string::npos)
+      i->ptx_tma.kind = ptx_tma_op::PREFETCH;
+    else
+      i->ptx_tma.kind = ptx_tma_op::LOAD;
+    for (unsigned r = 1; r <= 5; ++r)
+      if (g_tma_opcode.find("." + std::to_string(r) + "d") != std::string::npos)
+        i->ptx_tma.rank = r;
+    i->ptx_tma.multicast = g_tma_opcode.find(".multicast::cluster") != std::string::npos;
   }
   g_instructions.push_back(i);
   g_inst_lookup[gpgpu_ctx->g_filename][ptx_get_lineno(scanner)] = i;
@@ -752,7 +766,7 @@ void ptx_recognizer::append_vector_operand(const char *identifier) {
 void ptx_recognizer::finish_vector_operand() {
   parse_assert(!g_vector_operands.empty() && g_vector_operands.size() <= 128,
                "vector tuple must contain between 1 and 128 operands");
-  if (g_matrix_opcode.empty())
+  if (g_matrix_opcode.empty() && g_tma_opcode.empty())
     parse_assert(g_vector_operands.size() == 1 || g_vector_operands.size() == 2 ||
                  g_vector_operands.size() == 3 || g_vector_operands.size() == 4 ||
                  g_vector_operands.size() == 8, "unsupported legacy vector tuple length");
@@ -836,6 +850,53 @@ void ptx_recognizer::add_mbarrier_opcode(const char *opcode) {
   g_scalar_type.clear();
   g_scalar_type.push_back(B64_TYPE);
   g_space_spec = shared_space;
+}
+
+void ptx_recognizer::add_tma_opcode(const char *opcode) {
+  const std::string text(opcode);
+  const bool load = std::regex_match(text, std::regex(
+      "cp\\.async\\.bulk\\.tensor\\.[1-5]d\\.shared::cluster\\.global(\\.tile)?\\.mbarrier::complete_tx::bytes(\\.multicast::cluster)?(\\.L2::cache_hint)?"));
+  const bool prefetch = std::regex_match(text, std::regex(
+      "cp\\.async\\.bulk\\.prefetch\\.tensor\\.[1-5]d\\.L2\\.global"));
+  parse_assert(load || prefetch, "unsupported TMA opcode/modifier: %s", opcode);
+  g_opcode = TMA_PTX_OP;
+  g_tma_opcode = text;
+  g_scalar_type.clear();
+  g_scalar_type.push_back(B64_TYPE);
+  g_space_spec = global_space;
+}
+
+void ptx_recognizer::validate_tma_operands() {
+  if (g_tma_opcode.empty()) return;
+  std::vector<operand_info> ops(g_operands.begin(), g_operands.end());
+  const bool prefetch = g_tma_opcode.find(".prefetch.") != std::string::npos;
+  const bool multicast = g_tma_opcode.find(".multicast::cluster") != std::string::npos;
+  const bool cache_hint = g_tma_opcode.find(".L2::cache_hint") != std::string::npos;
+  const unsigned coord_pos = prefetch ? 1 : 2;
+  parse_assert(ops.size() == (prefetch ? 2 : 4 + unsigned(multicast) + unsigned(cache_hint)),
+               "TMA tensor operand count mismatch");
+  parse_assert(ops[0].is_memory_operand() || ops[0].is_reg(),
+               "TMA requires an address operand");
+  if (!prefetch)
+    parse_assert(ops[1].is_reg() || ops[1].is_memory_operand(),
+                 "TMA descriptor requires an address operand");
+  parse_assert(ops[coord_pos].is_vector(), "TMA coordinates require a vector tuple");
+  const unsigned rank = g_tma_opcode[g_tma_opcode.find("tensor.") + 7] - '0';
+  parse_assert(ops[coord_pos].get_vect_nelem() == rank, "TMA coordinate rank mismatch");
+  for (unsigned r = 0; r < rank; ++r) {
+    const symbol *s = ops[coord_pos].vec_symbol(r);
+    parse_assert(s->is_reg() && (s->type()->get_key().scalar_type() == B32_TYPE ||
+                 s->type()->get_key().scalar_type() == S32_TYPE ||
+                 s->type()->get_key().scalar_type() == U32_TYPE),
+                 "TMA coordinates require 32-bit registers");
+  }
+  if (!prefetch) {
+    parse_assert(ops[3].is_memory_operand(), "TMA completion requires an mbarrier address");
+    if (multicast) parse_assert(ops[4].is_reg() || ops[4].is_literal(),
+                               "TMA multicast mask requires a scalar");
+    if (cache_hint) parse_assert(ops.back().is_reg() || ops.back().is_literal(),
+                                "TMA cache hint requires a scalar");
+  }
 }
 
 void ptx_recognizer::validate_matrix_operands() {
