@@ -103,6 +103,7 @@
  */
 
 #include <assert.h>
+#include <cctype>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2224,6 +2225,64 @@ cudaFuncSetCacheConfigInternal(const char *func, enum cudaFuncCache cacheConfig,
 
 #endif
 
+// Driver module state belongs to the same simulator context as runtime launches.
+// The public subset intentionally supports only text PTX and the default stream.
+static CUmod_st *driver_module(gpgpu_context *ctx, CUmodule handle) {
+  auto i = ctx->api->driver_modules.find(handle);
+  return i == ctx->api->driver_modules.end() || !i->second->active
+             ? NULL : i->second.get();
+}
+
+static CUfunc_st *driver_function(gpgpu_context *ctx, CUfunction handle) {
+  auto i = ctx->api->driver_functions.find(handle);
+  return i == ctx->api->driver_functions.end() || !i->second->active ||
+             !handle->active || !handle->module->active
+             ? NULL : handle;
+}
+
+static CUresult driver_unsupported(const char *api) {
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", api);
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+static CUresult driver_load(CUmodule *output, const void *image,
+                            const char *source) {
+  if (!output || !image) return CUDA_ERROR_INVALID_VALUE;
+  gpgpu_context *ctx = GPGPU_Context();
+  if (!ctx->api->driver_initialized) return CUDA_ERROR_NOT_INITIALIZED;
+  // PTX must be NUL-terminated, as required by cuModuleLoadData. Binary input
+  // cannot be passed to the lexer (and may not even contain a terminator).
+  const char *text = static_cast<const char *>(image);
+  if (text[0] != '.' && text[0] != '/' && !isspace((unsigned char)text[0]))
+    return driver_unsupported(source);
+  std::string ptx(text);
+  if (ptx.find(".version") == std::string::npos ||
+      ptx.find(".target") == std::string::npos)
+    return CUDA_ERROR_INVALID_PTX;
+  GPGPUSim_Context(ctx);
+  std::string name = std::string(source) + ":" +
+                     std::to_string(ctx->api->driver_modules.size());
+  symbol_table *symbols;
+  try {
+    symbols = ctx->load_driver_ptx(ptx.c_str(), name.c_str());
+  } catch (const std::exception &error) {
+    fprintf(stderr, "%s: CUDA_ERROR_INVALID_PTX: %s\n", name.c_str(), error.what());
+    return CUDA_ERROR_INVALID_PTX;
+  }
+  if (symbols->global_iterator_begin() != symbols->global_iterator_end() ||
+      symbols->const_iterator_begin() != symbols->const_iterator_end())
+    return driver_unsupported("cuModuleLoad static global/constant allocation");
+  std::unique_ptr<CUmod_st> module(new CUmod_st);
+  module->symbols = symbols;
+  module->active = true;
+  CUmodule handle = module.get();
+  ctx->api->driver_modules.emplace(handle, std::move(module));
+  *output = handle;
+  printf("DRIVER_MODULE event=load source=%s modules=%zu\n", source,
+         ctx->api->driver_modules.size());
+  return CUDA_SUCCESS;
+}
+
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuLaunchKernelInternal(
     CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
@@ -2239,15 +2298,38 @@ CUresult CUDAAPI cuLaunchKernelInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  if (extra != NULL) {
-    printf(
-        "GPGPU-Sim CUDA DRIVER API: ERROR: Currently do not support void** "
-        "extra.\n");
-    abort();
-  }
-  const char *hostFun = (const char *)f;
   CUctx_st *context = GPGPUSim_Context(ctx);
-  function_info *entry = context->get_kernel(hostFun);
+  const char *hostFun = (const char *)f;
+  // Includes checked legacy host-function lookup so existing registered CUDA
+  // kernels keep working, without asserting on an arbitrary public handle.
+  function_info *entry = context->find_kernel(hostFun);
+  if (!entry) return CUDA_ERROR_INVALID_HANDLE;
+  const cudaDeviceProp *prop = context->get_device()->get_prop();
+  if (!gridDimX || !gridDimY || !gridDimZ ||
+      !blockDimX || !blockDimY || !blockDimZ ||
+      gridDimX > (unsigned)prop->maxGridSize[0] ||
+      gridDimY > (unsigned)prop->maxGridSize[1] ||
+      gridDimZ > (unsigned)prop->maxGridSize[2] ||
+      blockDimX > (unsigned)prop->maxThreadsDim[0] ||
+      blockDimY > (unsigned)prop->maxThreadsDim[1] ||
+      blockDimZ > (unsigned)prop->maxThreadsDim[2] ||
+      uint64_t(blockDimX) * blockDimY * blockDimZ >
+          (unsigned)prop->maxThreadsPerBlock)
+    return CUDA_ERROR_INVALID_VALUE;
+  if (kernelParams && extra) return CUDA_ERROR_INVALID_VALUE;
+  if (entry->get_maxnt_id() &&
+      uint64_t(blockDimX) * blockDimY * blockDimZ > entry->get_maxnt_id())
+    return CUDA_ERROR_INVALID_VALUE;
+  if (extra) return driver_unsupported("cuLaunchKernel extra buffer");
+  if (sharedMemBytes) return driver_unsupported("cuLaunchKernel dynamic shared memory");
+  if (hStream) return driver_unsupported("cuLaunchKernel non-default stream");
+  if (entry->num_args() && !kernelParams) return CUDA_ERROR_INVALID_VALUE;
+  for (unsigned i = 0; i < entry->num_args(); i++)
+    if (!kernelParams[i]) return CUDA_ERROR_INVALID_VALUE;
+  printf("DRIVER_LAUNCH kernel=%s grid=%u,%u,%u block=%u,%u,%u "
+         "shared=%u args=%u\n", entry->get_name().c_str(), gridDimX,
+         gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+         sharedMemBytes, entry->num_args());
   cudaConfigureCallInternal(dim3(gridDimX, gridDimY, gridDimZ),
                             dim3(blockDimX, blockDimY, blockDimZ),
                             sharedMemBytes, (cudaStream_t)hStream, ctx);
@@ -2255,7 +2337,8 @@ CUresult CUDAAPI cuLaunchKernelInternal(
     std::pair<size_t, unsigned> p = entry->get_param_config(i);
     cudaSetupArgumentInternal(kernelParams[i], p.first, p.second, ctx);
   }
-  cudaLaunchInternal(hostFun, ctx);
+  if (cudaLaunchInternal(hostFun, ctx) != cudaSuccess)
+    return CUDA_ERROR_LAUNCH_FAILED;
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 4000 */
@@ -4441,26 +4524,39 @@ kernel_info_t *cuda_runtime_api::gpgpu_cuda_ptx_sim_init_grid(
 //***extra api for pytorch***
 
 CUresult CUDAAPI cuGetErrorString(CUresult error, const char **pStr) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  return cuGetErrorName(error, pStr);
 }
 
 CUresult CUDAAPI cuGetErrorName(CUresult error, const char **pStr) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  if (!pStr) return CUDA_ERROR_INVALID_VALUE;
+  const char *value = NULL;
+  switch (error) {
+#define DRIVER_ERROR(e) case e: value = #e; break
+    DRIVER_ERROR(CUDA_SUCCESS);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_VALUE);
+    DRIVER_ERROR(CUDA_ERROR_NOT_INITIALIZED);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_DEVICE);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_CONTEXT);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_HANDLE);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_PTX);
+    DRIVER_ERROR(CUDA_ERROR_INVALID_IMAGE);
+    DRIVER_ERROR(CUDA_ERROR_NOT_FOUND);
+    DRIVER_ERROR(CUDA_ERROR_FILE_NOT_FOUND);
+    DRIVER_ERROR(CUDA_ERROR_NOT_SUPPORTED);
+    DRIVER_ERROR(CUDA_ERROR_LAUNCH_FAILED);
+#undef DRIVER_ERROR
+    default: return CUDA_ERROR_INVALID_VALUE;
   }
-  printf("WARNING: this function has not been implemented yet.");
+  *pStr = value;
   return CUDA_SUCCESS;
 }
 
+extern "C" void gpgpu_driver_modern_anchor();
+
 CUresult CUDAAPI cuInit(unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
+  gpgpu_driver_modern_anchor();
+  if (Flags) return CUDA_ERROR_INVALID_VALUE;
+  GPGPU_Context()->api->driver_initialized = true;
   return CUDA_SUCCESS;
 }
 
@@ -4528,8 +4624,8 @@ CUresult CUDAAPI cuDeviceGetProperties(CUdevprop *prop, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
@@ -4537,8 +4633,8 @@ CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 7000
@@ -4547,24 +4643,24 @@ CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxRelease(CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags,
@@ -4572,16 +4668,16 @@ CUresult CUDAAPI cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 7000 */
@@ -4592,8 +4688,8 @@ CUresult CUDAAPI cuCtxCreate(CUcontext *pctx, unsigned int flags,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -4602,8 +4698,8 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -4612,32 +4708,32 @@ CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxSetCurrent(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxGetCurrent(CUcontext *pctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -4645,8 +4741,8 @@ CUresult CUDAAPI cuCtxGetDevice(CUdevice *device) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 7000
@@ -4654,16 +4750,15 @@ CUresult CUDAAPI cuCtxGetFlags(unsigned int *flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 7000 */
 
 CUresult CUDAAPI cuCtxSynchronize(void) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
+  if (!GPGPU_Context()->api->driver_initialized) return CUDA_ERROR_NOT_INITIALIZED;
+  GPGPUSim_Context(GPGPU_Context());
+  GPGPU_Context()->synchronize();
   return CUDA_SUCCESS;
 }
 
@@ -4671,32 +4766,32 @@ CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxGetCacheConfig(CUfunc_cache *pconfig) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxSetCacheConfig(CUfunc_cache config) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 4020
@@ -4704,16 +4799,16 @@ CUresult CUDAAPI cuCtxGetSharedMemConfig(CUsharedconfig *pConfig) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxSetSharedMemConfig(CUsharedconfig config) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif
 
@@ -4721,8 +4816,8 @@ CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int *version) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxGetStreamPriorityRange(int *leastPriority,
@@ -4730,75 +4825,97 @@ CUresult CUDAAPI cuCtxGetStreamPriorityRange(int *leastPriority,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxAttach(CUcontext *pctx, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxDetach(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuModuleLoad(CUmodule *module, const char *fname) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  if (!module || !fname) return CUDA_ERROR_INVALID_VALUE;
+  std::ifstream input(fname, std::ios::binary);
+  if (!input) return CUDA_ERROR_FILE_NOT_FOUND;
+  std::ostringstream data;
+  data << input.rdbuf();
+  const std::string text = data.str();
+  if (text.empty()) return CUDA_ERROR_INVALID_PTX;
+  return driver_load(module, text.c_str(), fname);
 }
 
 CUresult CUDAAPI cuModuleLoadData(CUmodule *module, const void *image) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  return driver_load(module, image, "cuModuleLoadData");
 }
 
 CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image,
                                     unsigned int numOptions,
                                     CUjit_option *options,
                                     void **optionValues) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  if (!module || !image) return CUDA_ERROR_INVALID_VALUE;
+  if (numOptions && (!options || !optionValues)) return CUDA_ERROR_INVALID_VALUE;
+  if (numOptions) return driver_unsupported("cuModuleLoadDataEx JIT options");
+  return driver_load(module, image, "cuModuleLoadDataEx");
 }
 
 CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuModuleUnload(CUmodule hmod) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  gpgpu_context *ctx = GPGPU_Context();
+  CUmod_st *module = driver_module(ctx, hmod);
+  if (!module) return CUDA_ERROR_INVALID_HANDLE;
+  // Default-stream work may still reference function_info and instruction PCs.
+  // Drain before invalidating handles; parsed IR stays owned by the simulator.
+  ctx->synchronize();
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  for (auto &function : module->functions) {
+    function.second->active = false;
+    context->unregister_function((const char *)function.second.get());
   }
-  printf("WARNING: this function has not been implemented yet.");
+  module->active = false;
+  printf("DRIVER_MODULE event=unload functions=%zu\n", module->functions.size());
   return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
                                      const char *name) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  if (!hfunc || !name) return CUDA_ERROR_INVALID_VALUE;
+  gpgpu_context *ctx = GPGPU_Context();
+  CUmod_st *module = driver_module(ctx, hmod);
+  if (!module) return CUDA_ERROR_INVALID_HANDLE;
+  symbol *sym = module->symbols->lookup(name);
+  function_info *entry = sym && sym->is_func_addr() ? sym->get_pc() : NULL;
+  if (!entry || !entry->is_entry_point()) return CUDA_ERROR_NOT_FOUND;
+  auto i = module->functions.find(name);
+  if (i == module->functions.end()) {
+    std::unique_ptr<CUfunc_st> function(new CUfunc_st{module, entry, true});
+    CUfunction handle = function.get();
+    module->functions.emplace(name, std::move(function));
+    ctx->api->driver_functions.emplace(handle, module);
+    GPGPUSim_Context(ctx)->register_hostFun_function((const char *)handle, entry);
+    *hfunc = handle;
+  } else {
+    *hfunc = i->second.get();
   }
-  printf("WARNING: this function has not been implemented yet.");
+  printf("DRIVER_FUNCTION event=query name=%s params=%u\n", name, entry->num_args());
   return CUDA_SUCCESS;
 }
 
@@ -4808,8 +4925,8 @@ CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -4818,8 +4935,8 @@ CUresult CUDAAPI cuModuleGetTexRef(CUtexref *pTexRef, CUmodule hmod,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuModuleGetSurfRef(CUsurfref *pSurfRef, CUmodule hmod,
@@ -4827,8 +4944,8 @@ CUresult CUDAAPI cuModuleGetSurfRef(CUsurfref *pSurfRef, CUmodule hmod,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 6050
@@ -4889,16 +5006,16 @@ CUresult CUDAAPI cuMemGetInfo(size_t *free, size_t *total) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemAllocPitch(CUdeviceptr *dptr, size_t *pPitch,
@@ -4907,16 +5024,16 @@ CUresult CUDAAPI cuMemAllocPitch(CUdeviceptr *dptr, size_t *pPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemFree(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
@@ -4924,16 +5041,16 @@ CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemAllocHost(void **pp, size_t bytesize) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -4941,8 +5058,8 @@ CUresult CUDAAPI cuMemFreeHost(void *p) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemHostAlloc(void **pp, size_t bytesize,
@@ -4950,8 +5067,8 @@ CUresult CUDAAPI cuMemHostAlloc(void **pp, size_t bytesize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 3020
@@ -4960,8 +5077,8 @@ CUresult CUDAAPI cuMemHostGetDevicePointer(CUdeviceptr *pdptr, void *p,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -4969,8 +5086,8 @@ CUresult CUDAAPI cuMemHostGetFlags(unsigned int *pFlags, void *p) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 6000
@@ -4980,8 +5097,8 @@ CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 6000 */
@@ -4992,24 +5109,24 @@ CUresult CUDAAPI cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
@@ -5017,16 +5134,16 @@ CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
@@ -5034,16 +5151,16 @@ CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 4010 */
@@ -5054,8 +5171,8 @@ CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 __host__ cudaError_t cudaHostRegister(void *ptr, size_t size,
                                       unsigned int flags) {
@@ -5089,16 +5206,16 @@ CUresult CUDAAPI cuMemHostUnregister(void *p) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
@@ -5107,8 +5224,8 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 4000 */
@@ -5119,8 +5236,8 @@ CUresult CUDAAPI cuMemcpyHtoD(CUdeviceptr dstDevice, const void *srcHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice,
@@ -5128,8 +5245,8 @@ CUresult CUDAAPI cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
@@ -5137,8 +5254,8 @@ CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset,
@@ -5146,8 +5263,8 @@ CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyAtoD(CUdeviceptr dstDevice, CUarray srcArray,
@@ -5155,8 +5272,8 @@ CUresult CUDAAPI cuMemcpyAtoD(CUdeviceptr dstDevice, CUarray srcArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset,
@@ -5164,8 +5281,8 @@ CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyAtoH(void *dstHost, CUarray srcArray, size_t srcOffset,
@@ -5173,8 +5290,8 @@ CUresult CUDAAPI cuMemcpyAtoH(void *dstHost, CUarray srcArray, size_t srcOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyAtoA(CUarray dstArray, size_t dstOffset,
@@ -5183,32 +5300,32 @@ CUresult CUDAAPI cuMemcpyAtoA(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy3D(const CUDA_MEMCPY3D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -5217,8 +5334,8 @@ CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
@@ -5226,8 +5343,8 @@ CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
@@ -5236,8 +5353,8 @@ CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -5247,8 +5364,8 @@ CUresult CUDAAPI cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void *srcHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyDtoHAsync(void *dstHost, CUdeviceptr srcDevice,
@@ -5256,8 +5373,8 @@ CUresult CUDAAPI cuMemcpyDtoHAsync(void *dstHost, CUdeviceptr srcDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
@@ -5265,8 +5382,8 @@ CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset,
@@ -5275,8 +5392,8 @@ CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpyAtoHAsync(void *dstHost, CUarray srcArray,
@@ -5285,24 +5402,24 @@ CUresult CUDAAPI cuMemcpyAtoHAsync(void *dstHost, CUarray srcArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D *pCopy, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemcpy3DAsync(const CUDA_MEMCPY3D *pCopy, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -5312,8 +5429,8 @@ CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -5322,8 +5439,8 @@ CUresult CUDAAPI cuMemsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD16(CUdeviceptr dstDevice, unsigned short us,
@@ -5331,16 +5448,16 @@ CUresult CUDAAPI cuMemsetD16(CUdeviceptr dstDevice, unsigned short us,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD32(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D8(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5348,8 +5465,8 @@ CUresult CUDAAPI cuMemsetD2D8(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D16(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5357,8 +5474,8 @@ CUresult CUDAAPI cuMemsetD2D16(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D32(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5366,8 +5483,8 @@ CUresult CUDAAPI cuMemsetD2D32(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
@@ -5375,8 +5492,8 @@ CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
@@ -5384,8 +5501,8 @@ CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
@@ -5393,8 +5510,8 @@ CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5403,8 +5520,8 @@ CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5413,8 +5530,8 @@ CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
@@ -5423,8 +5540,8 @@ CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuArrayCreate(CUarray *pHandle,
@@ -5432,8 +5549,8 @@ CUresult CUDAAPI cuArrayCreate(CUarray *pHandle,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR *pArrayDescriptor,
@@ -5441,8 +5558,8 @@ CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR *pArrayDescriptor,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -5450,8 +5567,8 @@ CUresult CUDAAPI cuArrayDestroy(CUarray hArray) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 3020
@@ -5460,8 +5577,8 @@ CUresult CUDAAPI cuArray3DCreate(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuArray3DGetDescriptor(
@@ -5469,8 +5586,8 @@ CUresult CUDAAPI cuArray3DGetDescriptor(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -5493,16 +5610,16 @@ CUresult CUDAAPI cuMipmappedArrayGetLevel(CUarray *pLevelArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 5000 */
@@ -5516,8 +5633,8 @@ CUresult CUDAAPI cuPointerGetAttribute(void *data,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -5537,8 +5654,8 @@ CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count,
@@ -5546,8 +5663,8 @@ CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemRangeGetAttribute(void *data, size_t dataSize,
@@ -5556,8 +5673,8 @@ CUresult CUDAAPI cuMemRangeGetAttribute(void *data, size_t dataSize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemRangeGetAttributes(void **data, size_t *dataSizes,
@@ -5567,8 +5684,8 @@ CUresult CUDAAPI cuMemRangeGetAttributes(void **data, size_t *dataSizes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 8000 */
 
@@ -5579,8 +5696,8 @@ CUresult CUDAAPI cuPointerSetAttribute(const void *value,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 6000 */
 
@@ -5591,8 +5708,8 @@ CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 7000 */
 
@@ -5602,8 +5719,8 @@ CUresult CUDAAPI cuStreamCreate(CUstream *phStream, unsigned int Flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamCreateWithPriority(CUstream *phStream,
@@ -5611,24 +5728,24 @@ CUresult CUDAAPI cuStreamCreateWithPriority(CUstream *phStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
@@ -5636,8 +5753,8 @@ CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
@@ -5646,8 +5763,8 @@ CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 6000
@@ -5657,8 +5774,8 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 6000 */
@@ -5667,16 +5784,16 @@ CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 4000
@@ -5684,8 +5801,8 @@ CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -5695,32 +5812,32 @@ CUresult CUDAAPI cuEventCreate(CUevent *phEvent, unsigned int Flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuEventQuery(CUevent hEvent) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuEventSynchronize(CUevent hEvent) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 4000
@@ -5728,8 +5845,8 @@ CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -5738,8 +5855,8 @@ CUresult CUDAAPI cuEventElapsedTime(float *pMilliseconds, CUevent hStart,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 8000
@@ -5748,8 +5865,8 @@ CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
@@ -5757,8 +5874,8 @@ CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
@@ -5767,8 +5884,8 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 8000 */
 
@@ -5776,19 +5893,37 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
 
 CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                                     CUfunction hfunc) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  if (!pi) return CUDA_ERROR_INVALID_VALUE;
+  gpgpu_context *ctx = GPGPU_Context();
+  CUfunc_st *function = driver_function(ctx, hfunc);
+  if (!function) return CUDA_ERROR_INVALID_HANDLE;
+  int value;
+  switch (attrib) {
+    case CU_FUNC_ATTRIBUTE_PTX_VERSION:
+      value = int(10 * function->entry->get_ptx_version().ver()); break;
+    case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES:
+      value = function->entry->get_symtab()->get_shared_next(); break;
+    case CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES:
+      value = 0; break;  // dynamic allocation/resource accounting unsupported
+    default: return driver_unsupported("cuFuncGetAttribute unavailable metadata");
   }
-  printf("WARNING: this function has not been implemented yet.");
+  *pi = value;
   return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc,
+                                      CUfunction_attribute attrib, int value) {
+  if (!driver_function(GPGPU_Context(), hfunc)) return CUDA_ERROR_INVALID_HANDLE;
+  if (value < 0) return CUDA_ERROR_INVALID_VALUE;
+  return driver_unsupported("cuFuncSetAttribute");
 }
 
 CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 4020
@@ -5797,8 +5932,8 @@ CUresult CUDAAPI cuFuncSetSharedMemConfig(CUfunction hfunc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif
 
@@ -5821,40 +5956,40 @@ CUresult CUDAAPI cuFuncSetBlockShape(CUfunction hfunc, int x, int y, int z) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuFuncSetSharedSize(CUfunction hfunc, unsigned int bytes) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuParamSetSize(CUfunction hfunc, unsigned int numbytes) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuParamSeti(CUfunction hfunc, int offset, unsigned int value) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuParamSetf(CUfunction hfunc, int offset, float value) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuParamSetv(CUfunction hfunc, int offset, void *ptr,
@@ -5862,24 +5997,24 @@ CUresult CUDAAPI cuParamSetv(CUfunction hfunc, int offset, void *ptr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuLaunch(CUfunction f) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuLaunchGrid(CUfunction f, int grid_width, int grid_height) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuLaunchGridAsync(CUfunction f, int grid_width,
@@ -5887,8 +6022,8 @@ CUresult CUDAAPI cuLaunchGridAsync(CUfunction f, int grid_width,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuParamSetTexRef(CUfunction hfunc, int texunit,
@@ -5896,8 +6031,8 @@ CUresult CUDAAPI cuParamSetTexRef(CUfunction hfunc, int texunit,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 /** @} */ /* END CUDA_EXEC_DEPRECATED */
 
@@ -5908,8 +6043,8 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
@@ -5918,8 +6053,8 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuOccupancyMaxPotentialBlockSize(
@@ -5929,8 +6064,8 @@ CUresult CUDAAPI cuOccupancyMaxPotentialBlockSize(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuOccupancyMaxPotentialBlockSizeWithFlags(
@@ -5940,8 +6075,8 @@ CUresult CUDAAPI cuOccupancyMaxPotentialBlockSizeWithFlags(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /** @} */ /* END CUDA_OCCUPANCY */
@@ -5952,8 +6087,8 @@ CUresult CUDAAPI cuTexRefSetArray(CUtexref hTexRef, CUarray hArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetMipmappedArray(CUtexref hTexRef,
@@ -5962,8 +6097,8 @@ CUresult CUDAAPI cuTexRefSetMipmappedArray(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 3020
@@ -5972,8 +6107,8 @@ CUresult CUDAAPI cuTexRefSetAddress(size_t *ByteOffset, CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetAddress2D(CUtexref hTexRef,
@@ -5982,8 +6117,8 @@ CUresult CUDAAPI cuTexRefSetAddress2D(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -5992,8 +6127,8 @@ CUresult CUDAAPI cuTexRefSetFormat(CUtexref hTexRef, CUarray_format fmt,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetAddressMode(CUtexref hTexRef, int dim,
@@ -6001,16 +6136,16 @@ CUresult CUDAAPI cuTexRefSetAddressMode(CUtexref hTexRef, int dim,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetFilterMode(CUtexref hTexRef, CUfilter_mode fm) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetMipmapFilterMode(CUtexref hTexRef,
@@ -6018,16 +6153,16 @@ CUresult CUDAAPI cuTexRefSetMipmapFilterMode(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetMipmapLevelBias(CUtexref hTexRef, float bias) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetMipmapLevelClamp(CUtexref hTexRef,
@@ -6036,8 +6171,8 @@ CUresult CUDAAPI cuTexRefSetMipmapLevelClamp(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetMaxAnisotropy(CUtexref hTexRef,
@@ -6045,24 +6180,24 @@ CUresult CUDAAPI cuTexRefSetMaxAnisotropy(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetBorderColor(CUtexref hTexRef, float *pBorderColor) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefSetFlags(CUtexref hTexRef, unsigned int Flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 3020
@@ -6070,8 +6205,8 @@ CUresult CUDAAPI cuTexRefGetAddress(CUdeviceptr *pdptr, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -6079,8 +6214,8 @@ CUresult CUDAAPI cuTexRefGetArray(CUarray *phArray, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetMipmappedArray(CUmipmappedArray *phMipmappedArray,
@@ -6088,8 +6223,8 @@ CUresult CUDAAPI cuTexRefGetMipmappedArray(CUmipmappedArray *phMipmappedArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetAddressMode(CUaddress_mode *pam, CUtexref hTexRef,
@@ -6097,16 +6232,16 @@ CUresult CUDAAPI cuTexRefGetAddressMode(CUaddress_mode *pam, CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetFilterMode(CUfilter_mode *pfm, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetFormat(CUarray_format *pFormat, int *pNumChannels,
@@ -6114,8 +6249,8 @@ CUresult CUDAAPI cuTexRefGetFormat(CUarray_format *pFormat, int *pNumChannels,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetMipmapFilterMode(CUfilter_mode *pfm,
@@ -6123,16 +6258,16 @@ CUresult CUDAAPI cuTexRefGetMipmapFilterMode(CUfilter_mode *pfm,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetMipmapLevelBias(float *pbias, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetMipmapLevelClamp(float *pminMipmapLevelClamp,
@@ -6141,48 +6276,48 @@ CUresult CUDAAPI cuTexRefGetMipmapLevelClamp(float *pminMipmapLevelClamp,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetMaxAnisotropy(int *pmaxAniso, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetBorderColor(float *pBorderColor, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefGetFlags(unsigned int *pFlags, CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefCreate(CUtexref *pTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexRefDestroy(CUtexref hTexRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuSurfRefSetArray(CUsurfref hSurfRef, CUarray hArray,
@@ -6190,16 +6325,16 @@ CUresult CUDAAPI cuSurfRefSetArray(CUsurfref hSurfRef, CUarray hArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuSurfRefGetArray(CUarray *phArray, CUsurfref hSurfRef) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /** @} */ /* END CUDA_SURFREF */
@@ -6220,8 +6355,8 @@ CUresult CUDAAPI cuTexObjectDestroy(CUtexObject texObject) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
@@ -6229,8 +6364,8 @@ CUresult CUDAAPI cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC *pTexDesc,
@@ -6238,8 +6373,8 @@ CUresult CUDAAPI cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC *pTexDesc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuTexObjectGetResourceViewDesc(
@@ -6247,8 +6382,8 @@ CUresult CUDAAPI cuTexObjectGetResourceViewDesc(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /** @} */ /* END CUDA_TEXOBJECT */
@@ -6258,16 +6393,16 @@ CUresult CUDAAPI cuSurfObjectCreate(CUsurfObject *pSurfObject,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuSurfObjectDestroy(CUsurfObject surfObject) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
@@ -6275,8 +6410,8 @@ CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 5000 */
@@ -6287,8 +6422,8 @@ CUresult CUDAAPI cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
@@ -6298,8 +6433,8 @@ CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext,
@@ -6307,16 +6442,16 @@ CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuCtxDisablePeerAccess(CUcontext peerContext) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /** @} */ /* END CUDA_PEER_ACCESS */
@@ -6326,8 +6461,8 @@ CUresult CUDAAPI cuGraphicsUnregisterResource(CUgraphicsResource resource) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuGraphicsSubResourceGetMappedArray(
@@ -6336,8 +6471,8 @@ CUresult CUDAAPI cuGraphicsSubResourceGetMappedArray(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #if CUDART_VERSION >= 5000
@@ -6347,8 +6482,8 @@ CUresult CUDAAPI cuGraphicsResourceGetMappedMipmappedArray(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif /* CUDART_VERSION >= 5000 */
@@ -6359,8 +6494,8 @@ CUresult CUDAAPI cuGraphicsResourceGetMappedPointer(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
@@ -6369,8 +6504,8 @@ CUresult CUDAAPI cuGraphicsResourceSetMapFlags(CUgraphicsResource resource,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
@@ -6379,8 +6514,8 @@ CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
@@ -6389,8 +6524,8 @@ CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /** @} */ /* END CUDA_GRAPHICS */
@@ -6412,8 +6547,8 @@ CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* defined(CUDART_VERSION_INTERNAL) || (CUDART_VERSION >= 4000 && \
           CUDART_VERSION < 6050) */
@@ -6425,8 +6560,8 @@ CUresult CUDAAPI cuLinkCreate(unsigned int numOptions, CUjit_option *options,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
                                void *data, size_t size, const char *name,
@@ -6435,8 +6570,8 @@ CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
                                const char *path, unsigned int numOptions,
@@ -6444,8 +6579,8 @@ CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION_INTERNAL || (CUDART_VERSION >= 5050 && CUDART_VERSION \
           < 6050) */
@@ -6458,8 +6593,8 @@ CUresult CUDAAPI cuTexRefSetAddress2D_v2(CUtexref hTexRef,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION_INTERNAL || (CUDART_VERSION >= 3020 && CUDART_VERSION \
           < 4010) */
@@ -6469,36 +6604,36 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif /* CUDART_VERSION_INTERNAL || CUDART_VERSION < 4000 */
 
@@ -6508,56 +6643,56 @@ CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyDtoA_v2(CUarray dstArray, size_t dstOffset,
                                  CUdeviceptr srcDevice, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyAtoD_v2(CUdeviceptr dstDevice, CUarray srcArray,
                                  size_t srcOffset, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyHtoA_v2(CUarray dstArray, size_t dstOffset,
                                  const void *srcHost, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
                                  size_t srcOffset, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyAtoA_v2(CUarray dstArray, size_t dstOffset,
                                  CUarray srcArray, size_t srcOffset,
@@ -6565,8 +6700,8 @@ CUresult CUDAAPI cuMemcpyAtoA_v2(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyHtoAAsync_v2(CUarray dstArray, size_t dstOffset,
                                       const void *srcHost, size_t ByteCount,
@@ -6574,8 +6709,8 @@ CUresult CUDAAPI cuMemcpyHtoAAsync_v2(CUarray dstArray, size_t dstOffset,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyAtoHAsync_v2(void *dstHost, CUarray srcArray,
                                       size_t srcOffset, size_t ByteCount,
@@ -6583,29 +6718,29 @@ CUresult CUDAAPI cuMemcpyAtoHAsync_v2(void *dstHost, CUarray srcArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
                                       const void *srcHost, size_t ByteCount,
@@ -6613,16 +6748,16 @@ CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
                                       size_t ByteCount, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice,
                                       CUdeviceptr srcDevice, size_t ByteCount,
@@ -6630,48 +6765,48 @@ CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy,
                                     CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy,
                                     CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc,
                                size_t N) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us,
                                 size_t N) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui,
                                 size_t N) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                  unsigned char uc, size_t Width,
@@ -6679,8 +6814,8 @@ CUresult CUDAAPI cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D16_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                   unsigned short us, size_t Width,
@@ -6688,8 +6823,8 @@ CUresult CUDAAPI cuMemsetD2D16_v2(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D32_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                   unsigned int ui, size_t Width,
@@ -6697,23 +6832,23 @@ CUresult CUDAAPI cuMemsetD2D32_v2(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
                                size_t ByteCount, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                               CUdeviceptr srcDevice, CUcontext srcContext,
@@ -6721,8 +6856,8 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
@@ -6730,23 +6865,23 @@ CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
                                      CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
@@ -6754,24 +6889,24 @@ CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
                                   size_t N, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
                                   size_t N, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
                                    unsigned char uc, size_t Width,
@@ -6779,8 +6914,8 @@ CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned short us, size_t Width,
@@ -6788,8 +6923,8 @@ CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned int ui, size_t Width,
@@ -6797,31 +6932,31 @@ CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
                                      CUstreamCallback callback, void *userData,
@@ -6829,37 +6964,37 @@ CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
                                         size_t length, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
                                 unsigned int gridDimY, unsigned int gridDimZ,
@@ -6870,8 +7005,8 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
                                         CUgraphicsResource *resources,
@@ -6879,8 +7014,8 @@ CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
                                           CUgraphicsResource *resources,
@@ -6888,32 +7023,32 @@ CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
                                     CUdevice dstDevice, CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
                                       cuuint32_t value, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
                                      cuuint32_t value, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
                                     CUstreamBatchMemOpParams *paramArray,
@@ -6921,8 +7056,8 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 #endif
 
@@ -6956,8 +7091,8 @@ extern "C" CUresult CUDAAPI cuMemcpy_ptds(CUdeviceptr dst, CUdeviceptr src,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
@@ -6968,8 +7103,8 @@ extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyHtoD_v2_ptds(CUdeviceptr dstDevice,
@@ -6978,8 +7113,8 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoD_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoH_v2_ptds(void *dstHost,
                                                  CUdeviceptr srcDevice,
@@ -6987,8 +7122,8 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoH_v2_ptds(void *dstHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoD_v2_ptds(CUdeviceptr dstDevice,
                                                  CUdeviceptr srcDevice,
@@ -6996,8 +7131,8 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoD_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy2DUnaligned_v2_ptds(const CUDA_MEMCPY2D *pCopy) {
@@ -7011,8 +7146,8 @@ extern "C" CUresult CUDAAPI cuMemcpy3D_v2_ptds(const CUDA_MEMCPY3D *pCopy) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy3DPeer_ptds(const CUDA_MEMCPY3D_PEER *pCopy) {
@@ -7028,8 +7163,8 @@ extern "C" CUresult CUDAAPI cuMemsetD8_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD16_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned short us,
@@ -7037,8 +7172,8 @@ extern "C" CUresult CUDAAPI cuMemsetD16_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD32_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned int ui,
@@ -7046,8 +7181,8 @@ extern "C" CUresult CUDAAPI cuMemsetD32_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D8_v2_ptds(CUdeviceptr dstDevice,
                                                  unsigned int dstPitch,
@@ -7057,8 +7192,8 @@ extern "C" CUresult CUDAAPI cuMemsetD2D8_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D16_v2_ptds(CUdeviceptr dstDevice,
                                                   unsigned int dstPitch,
@@ -7068,8 +7203,8 @@ extern "C" CUresult CUDAAPI cuMemsetD2D16_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D32_v2_ptds(CUdeviceptr dstDevice,
                                                   unsigned int dstPitch,
@@ -7079,8 +7214,8 @@ extern "C" CUresult CUDAAPI cuMemsetD2D32_v2_ptds(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 //_ptsz
@@ -7099,8 +7234,8 @@ extern "C" CUresult CUDAAPI cuMemcpyAsync_ptsz(CUdeviceptr dst, CUdeviceptr src,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(
@@ -7109,8 +7244,8 @@ extern "C" CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyHtoAAsync_v2_ptsz(CUarray dstArray,
                                                       size_t dstOffset,
@@ -7120,8 +7255,8 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoAAsync_v2_ptsz(CUarray dstArray,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyAtoHAsync_v2_ptsz(void *dstHost,
                                                       CUarray srcArray,
@@ -7131,8 +7266,8 @@ extern "C" CUresult CUDAAPI cuMemcpyAtoHAsync_v2_ptsz(void *dstHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyHtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       const void *srcHost,
@@ -7141,8 +7276,8 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoHAsync_v2_ptsz(void *dstHost,
                                                       CUdeviceptr srcDevice,
@@ -7151,8 +7286,8 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoHAsync_v2_ptsz(void *dstHost,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       CUdeviceptr srcDevice,
@@ -7161,24 +7296,24 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpy2DAsync_v2_ptsz(const CUDA_MEMCPY2D *pCopy,
                                                     CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemcpy3DAsync_v2_ptsz(const CUDA_MEMCPY3D *pCopy,
                                                     CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream) {
@@ -7195,8 +7330,8 @@ extern "C" CUresult CUDAAPI cuMemsetD8Async_ptsz(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D8Async_ptsz(CUdeviceptr dstDevice,
                                                    size_t dstPitch,
@@ -7206,8 +7341,8 @@ extern "C" CUresult CUDAAPI cuMemsetD2D8Async_ptsz(CUdeviceptr dstDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(
     CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
@@ -7217,16 +7352,16 @@ extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuEventRecord_ptsz(CUevent hEvent,
                                                CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamWriteValue32_ptsz(CUstream stream,
                                                       CUdeviceptr addr,
@@ -7235,8 +7370,8 @@ extern "C" CUresult CUDAAPI cuStreamWriteValue32_ptsz(CUstream stream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamWaitValue32_ptsz(CUstream stream,
                                                      CUdeviceptr addr,
@@ -7245,8 +7380,8 @@ extern "C" CUresult CUDAAPI cuStreamWaitValue32_ptsz(CUstream stream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamBatchMemOp_ptsz(
     CUstream stream, unsigned int count, CUstreamBatchMemOpParams *paramArray,
@@ -7254,24 +7389,24 @@ extern "C" CUresult CUDAAPI cuStreamBatchMemOp_ptsz(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamGetPriority_ptsz(CUstream hStream,
                                                      int *priority) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamGetFlags_ptsz(CUstream hStream,
                                                   unsigned int *flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuStreamWaitEvent_ptsz(CUstream hStream,
@@ -7280,8 +7415,8 @@ extern "C" CUresult CUDAAPI cuStreamWaitEvent_ptsz(CUstream hStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuStreamAddCallback_ptsz(CUstream hStream,
@@ -7291,24 +7426,24 @@ extern "C" CUresult CUDAAPI cuStreamAddCallback_ptsz(CUstream hStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuStreamSynchronize_ptsz(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuStreamQuery_ptsz(CUstream hStream) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuStreamAttachMemAsync_ptsz(CUstream hStream,
                                                         CUdeviceptr dptr,
@@ -7317,8 +7452,8 @@ extern "C" CUresult CUDAAPI cuStreamAttachMemAsync_ptsz(CUstream hStream,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuGraphicsMapResources_ptsz(
@@ -7326,8 +7461,8 @@ extern "C" CUresult CUDAAPI cuGraphicsMapResources_ptsz(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuGraphicsUnmapResources_ptsz(
@@ -7335,8 +7470,8 @@ extern "C" CUresult CUDAAPI cuGraphicsUnmapResources_ptsz(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 extern "C" CUresult CUDAAPI cuMemPrefetchAsync_ptsz(CUdeviceptr devPtr,
@@ -7346,6 +7481,6 @@ extern "C" CUresult CUDAAPI cuMemPrefetchAsync_ptsz(CUdeviceptr devPtr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet.");
-  return CUDA_SUCCESS;
+  fprintf(stderr, "GPGPU-Sim Driver API: %s: CUDA_ERROR_NOT_SUPPORTED\n", __my_func__);
+  return CUDA_ERROR_NOT_SUPPORTED;
 }

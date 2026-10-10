@@ -60,9 +60,12 @@ class ptx_recognizer {
     g_func_info = NULL;
     g_debug_ir_generation = false;
     gpgpu_ctx = ctx;
+    recoverable_errors = false;
   }
   // global list
   yyscan_t scanner;
+  // Public module loading may discard a failed, isolated parser instance.
+  bool recoverable_errors;
 #define PTX_LINEBUF_SIZE (4 * 1024)
   char linebuf[PTX_LINEBUF_SIZE];
   unsigned col;

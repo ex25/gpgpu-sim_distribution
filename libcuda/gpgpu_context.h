@@ -12,6 +12,7 @@ class gpgpu_context {
  public:
   gpgpu_context() {
     g_global_allfiles_symbol_table = NULL;
+    g_filename = NULL;
     sm_next_access_uid = 0;
     warp_inst_sm_next_uid = 0;
     operand_info_sm_next_uid = 1;
@@ -66,6 +67,7 @@ class gpgpu_context {
                                                          unsigned source_num);
   class symbol_table *gpgpu_ptx_sim_load_ptx_from_filename(
       const char *filename);
+  class symbol_table *load_driver_ptx(const char *text, const char *filename);
   void gpgpu_ptx_info_load_from_filename(const char *filename,
                                          unsigned sm_version);
   void gpgpu_ptxinfo_load_from_string(const char *p_for_info,

@@ -12,7 +12,7 @@ set_source_files_properties(${BISON_cuobjdump_parser_OUTPUT_SOURCE}
 
 # Create libcuda.a with all source files
 add_library(cuda STATIC 
-    cuda_runtime_api.cc
+    cuda_runtime_api.cc cuda_driver_modern.cc
     ${BISON_cuobjdump_parser_OUTPUT_SOURCE} ${FLEX_cuobjdump_lexer_OUTPUTS})
 
     # Add current dir to include path

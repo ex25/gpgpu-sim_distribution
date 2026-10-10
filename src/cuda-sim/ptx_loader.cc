@@ -202,6 +202,43 @@ symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_string(
   return symtab;
 }
 
+// Unlike the legacy embedded loader, Driver modules do not share a global
+// symbol table. Restore parser state even after an error; already assembled
+// instruction storage is retained because PCs and in-flight kernels refer to it.
+symbol_table *gpgpu_context::load_driver_ptx(const char *text,
+                                          const char *filename) {
+  ptx_recognizer *saved_parser = ptx_parser;
+  symbol_table *saved_global = g_global_allfiles_symbol_table;
+  const char *saved_filename = g_filename;
+  ptx_recognizer parser(this);
+  parser.g_shader_core_config = saved_parser->g_shader_core_config;
+  parser.col = 0;
+  memset(parser.linebuf, 0, sizeof(parser.linebuf));
+  parser.recoverable_errors = true;
+  symbol_table *table = new symbol_table(filename, 0, NULL, this);
+  ptx_parser = &parser;
+  g_global_allfiles_symbol_table = table;
+  g_filename = strdup(filename);  // instruction source metadata outlives load
+  parser.g_global_symbol_table = parser.g_current_symbol_table = table;
+  ptx_lex_init(&parser.scanner);
+  ptx__scan_string(text, parser.scanner);
+  try {
+    if (ptx_parse(parser.scanner, &parser) || parser.g_error_detected)
+      throw std::runtime_error("invalid PTX module");
+  } catch (...) {
+    ptx_lex_destroy(parser.scanner);
+    ptx_parser = saved_parser;
+    g_global_allfiles_symbol_table = saved_global;
+    g_filename = saved_filename;
+    throw;
+  }
+  ptx_lex_destroy(parser.scanner);
+  ptx_parser = saved_parser;
+  g_global_allfiles_symbol_table = saved_global;
+  g_filename = saved_filename;
+  return table;
+}
+
 symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_filename(
     const char *filename) {
   symbol_table *symtab = init_parser(filename);

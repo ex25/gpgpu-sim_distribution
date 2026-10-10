@@ -544,5 +544,7 @@ int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s )
 	printf("^\n\n");
 	fflush(stdout);
 	//exit(1);
+	if (recognizer->recoverable_errors)
+	  throw std::runtime_error("invalid PTX module");
 	return 0;
 }

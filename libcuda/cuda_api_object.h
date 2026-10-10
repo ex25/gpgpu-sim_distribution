@@ -4,6 +4,7 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -15,6 +16,20 @@
 #include "cuobjdump.h"
 
 typedef std::list<gpgpu_ptx_sim_arg> gpgpu_ptx_sim_arg_list_t;
+
+class symbol_table;
+class function_info;
+struct CUmod_st;
+struct CUfunc_st {
+  CUmod_st *module;
+  function_info *entry;
+  bool active;
+};
+struct CUmod_st {
+  symbol_table *symbols;
+  bool active;
+  std::map<std::string, std::unique_ptr<CUfunc_st> > functions;
+};
 
 #ifndef OPENGL_SUPPORT
 typedef unsigned long GLuint;
@@ -120,6 +135,17 @@ struct CUctx_st {
     return i->second;
   }
 
+  // Checked lookup for public Driver API handles. Legacy runtime registration
+  // still uses get_kernel(), whose assertion catches internal programming bugs.
+  function_info *find_kernel(const char *hostFun) const {
+    auto i = m_kernel_lookup.find(hostFun);
+    return i == m_kernel_lookup.end() ? NULL : i->second;
+  }
+
+  void unregister_function(const char *hostFun) {
+    m_kernel_lookup.erase(hostFun);
+  }
+
   int no_of_ptx;
 
  private:
@@ -178,6 +204,11 @@ class cuda_runtime_api {
   std::list<cuobjdumpSection *> libSectionList;
   std::list<kernel_config> g_cuda_launch_stack;
   std::map<int, bool> fatbin_registered;
+  // Retain handle tombstones: a stale CUmodule/CUfunction must never become
+  // valid again when the allocator reuses an address after module unload.
+  bool driver_initialized = false;
+  std::map<CUmod_st *, std::unique_ptr<CUmod_st> > driver_modules;
+  std::map<CUfunc_st *, CUmod_st *> driver_functions;
   std::map<int, std::string> fatbinmap;
   std::map<std::string, symbol_table *> name_symtab;
   std::map<unsigned long long, size_t> g_mallocPtr_Size;
