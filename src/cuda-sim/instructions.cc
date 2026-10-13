@@ -588,9 +588,17 @@ void ldmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   for (unsigned matrix = 0; matrix < matrices; ++matrix) {
     for (unsigned row = 0; row < 8; ++row) {
       ptx_thread_info *provider = core->get_thread_info()[base + matrix * 8 + row];
-      rows[matrix][row] = provider->get_operand_value(src, dst, U32_TYPE, provider, 0).u32;
+      // Keep the entire address, including the offset. Truncating to u32 can
+      // silently turn an invalid 64-bit address into a valid shared row.
+      rows[matrix][row] = provider->get_operand_value(src, dst, U64_TYPE, provider, 0).u64;
       if (rows[matrix][row] % 16) {
         fprintf(stderr, "%s:%u: ldmatrix shared row address must be 16-byte aligned\n",
+                pI->source_file(), pI->source_line());
+        abort();
+      }
+      const addr_t capacity = provider->get_finfo()->get_symtab()->get_shared_next();
+      if (rows[matrix][row] > capacity || capacity - rows[matrix][row] < 16) {
+        fprintf(stderr, "%s:%u: ldmatrix row exceeds declared shared memory\n",
                 pI->source_file(), pI->source_line());
         abort();
       }

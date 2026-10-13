@@ -1922,6 +1922,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       if (pI->ptx_matrix.kind == ptx_matrix_metadata::WGMMA &&
           inst.active_count() != MAX_WARP_SIZE)
         throw std::runtime_error(get_location() + ": incomplete WGMMA active warp");
+      if (inst_opcode == LDMATRIX_OP && inst.active_count() != MAX_WARP_SIZE)
+        throw std::runtime_error(get_location() + ": ldmatrix requires a full active warp");
       if (tensorcore_op(inst_opcode)) {
         if (inst.active_count() != MAX_WARP_SIZE) {
           printf(
@@ -2207,7 +2209,8 @@ const warp_inst_t *gpgpu_context::ptx_fetch_inst(address_type pc) {
   const ptx_instruction *inst = pc_to_instruction(pc);
   if (!inst) return nullptr;
   if (inst->ptx_matrix.kind != ptx_matrix_metadata::NONE &&
-      !inst->ptx_matrix.timing_supported) {
+      !inst->ptx_matrix.timing_supported &&
+      !the_gpgpusim->g_the_gpu->is_functional_sim()) {
     fprintf(stderr, "%s:%u: PTX matrix timing is not implemented: %s\n",
             inst->source_file(), inst->source_line(), inst->get_source());
     abort();

@@ -423,6 +423,11 @@ void ptx_recognizer::add_instruction() {
         i->ptx_matrix.m = 64;
         i->ptx_matrix.n = g_matrix_opcode.find("n176") != std::string::npos ? 176 : 128;
         i->ptx_matrix.k = 16;
+      } else if (g_opcode == MMA_SYNC_OP) {
+        i->ptx_matrix.m = 16;
+        i->ptx_matrix.n = 8;
+        i->ptx_matrix.k = g_matrix_opcode.find("k8.") != std::string::npos ? 8 :
+            g_matrix_opcode.find("k32.") != std::string::npos ? 32 : 16;
       }
     }
     if (i->ptx_matrix.kind == ptx_matrix_metadata::WGMMA) {
@@ -1141,6 +1146,13 @@ void ptx_recognizer::validate_matrix_operands() {
     tuple(0, count, B32_TYPE);
     const symbol *address = ops[1].get_symbol();
     parse_assert(address && (address->is_reg() || address->is_shared()), "ldmatrix address must be a register or shared symbol");
+    if (address->is_reg()) {
+      const int type = address->type()->get_key().scalar_type();
+      parse_assert(type == B32_TYPE || type == B64_TYPE ||
+                       type == U32_TYPE || type == U64_TYPE ||
+                       type == S32_TYPE || type == S64_TYPE,
+                   "ldmatrix address register must be a 32/64-bit integer or bit register");
+    }
     parse_assert(!g_pred, "predicated ldmatrix is not supported");
   } else if (g_opcode == MMA_SYNC_OP) {
     parse_assert(ops.size() == 4, "mma.sync requires four tuples");
