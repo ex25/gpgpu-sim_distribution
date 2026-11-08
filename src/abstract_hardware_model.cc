@@ -1320,6 +1320,7 @@ void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
     collective_impl(pI, this, inst);
   if (pI->is_cp_async() && inst.active_count()) cp_async_impl(pI, this, inst);
   if (pI->m_ptx_mbarrier && inst.active_count()) mbarrier_impl(pI, this, inst);
+  if (pI->is_tensor_ptx() && inst.active_count()) tensor_impl(pI, this, inst);
 }
 
 bool core_t::ptx_thread_done(unsigned hw_thread_id) const {

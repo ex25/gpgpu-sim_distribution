@@ -1093,6 +1093,9 @@ class ptx_instruction : public warp_inst_t {
   unsigned dimension() const { return m_geom_spec; }
   bool is_sync() const { return m_sync; }
   bool is_warp_barrier() const { return m_opcode == BAR_OP && m_warp_scope; }
+  bool is_tensor_ptx() const {
+    return m_opcode >= TM_ADDRESS_OP && m_opcode <= BULK_WAIT_OP;
+  }
   bool is_cp_async() const {
     return m_opcode == CP_ASYNC_OP || m_opcode == CP_ASYNC_COMMIT_OP ||
            m_opcode == CP_ASYNC_WAIT_OP;

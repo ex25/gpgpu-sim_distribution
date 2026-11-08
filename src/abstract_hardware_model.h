@@ -46,6 +46,7 @@
 #include <memory>
 #include <unordered_set>
 #include <vector>
+#include "cuda-sim/tensor_map.h"
 #include "statistics.h"
 #include "utils.h"
 
@@ -597,6 +598,7 @@ class kernel_info_t {
   ptx_shared_target resolve_local_shared(dim3 cta, unsigned offset) {
     return resolve_cluster_shared(cta, (cluster_rank(cta) << 24) | offset);
   }
+  std::map<new_addr_type, unsigned> ptx_tensor_publications;
   void retire_cluster_cta(dim3 cta);
   void cluster_arrive(dim3 id, uint64_t epoch, unsigned count, uint64_t cycle,
                       unsigned latency);
@@ -1535,6 +1537,7 @@ class inst_t {
   } arch_reg;
   // int arch_reg[MAX_REG_OPERANDS]; // register number for bank conflict
   // evaluation
+  ptx_tensor_kind m_ptx_tensor_op = PTX_TENSOR_NONE;
   unsigned latency;  // operation latency
   unsigned initiation_interval;
 
@@ -1577,6 +1580,31 @@ struct ptx_cp_async_copy {
   unsigned long long group;
   unsigned source_size;
   unsigned char data[16];
+};
+
+struct ptx_tensor_transfer {
+  struct target {
+    memory_space *shared;
+    mbarrier_t *barrier;
+    unsigned phase;
+    bool remote;
+  };
+  ptx_tensor_map map;
+  kernel_info_t *kernel = nullptr;
+  memory_space *global = nullptr;
+  memory_space *source_shared = nullptr;
+  new_addr_type descriptor = 0;
+  unsigned shared_base = 0;
+  unsigned lane = 0;
+  unsigned long long group = 0;
+  unsigned pending = 0;
+  unsigned write_pending = 0;
+  unsigned descriptor_pending = 0;
+  bool read_done = false;
+  int x = 0, y = 0;
+  std::vector<unsigned char> data;
+  std::vector<new_addr_type> addresses;
+  std::vector<target> targets;
 };
 
 class warp_inst_t : public inst_t {
@@ -1797,6 +1825,15 @@ class warp_inst_t : public inst_t {
 
   unsigned warp_size() const { return m_config->warp_size; }
 
+  void make_ptx_tensor_descriptor_read() {
+    memory_op = memory_load;
+    m_accessq.clear();
+    m_mem_accesses_created = false;
+    m_tma_access_addrs.clear();
+    for (unsigned i = 0; i < 128; i += 2)
+      m_tma_access_addrs.push_back(m_ptx_tensor->descriptor + i);
+    generate_mem_accesses();
+  }
   bool accessq_empty() const { return m_accessq.empty(); }
   unsigned accessq_count() const { return m_accessq.size(); }
   const mem_access_t &accessq_back() { return m_accessq.back(); }
@@ -1879,6 +1916,7 @@ class warp_inst_t : public inst_t {
   // Ni: add boolean to indicate whether the instruction is ldgsts
   bool m_is_ldgsts;
   // PTX copy/commit/wait are separate from trace DEPBAR classification.
+  std::shared_ptr<ptx_tensor_transfer> m_ptx_tensor;
   bool m_ptx_mbarrier = false;
   unsigned m_ptx_cluster_barrier = 0;  // 1 = arrive, 2 = wait
   ptx_cp_async_kind m_ptx_cp_async_op = PTX_CP_ASYNC_NONE;

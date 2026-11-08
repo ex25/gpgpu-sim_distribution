@@ -152,6 +152,10 @@ class shd_warp_t {
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
     m_ptx_mbarrier_pending = false;
+    m_ptx_tensor_pending = 0;
+    m_ptx_tensor_stores_outstanding = 0;
+    m_ptx_tensor_acquire.reset();
+    for (auto &g : m_ptx_bulk_groups) g = cp_async_groups();
     m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
@@ -209,6 +213,10 @@ class shd_warp_t {
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
     m_ptx_mbarrier_pending = false;
+    m_ptx_tensor_pending = 0;
+    m_ptx_tensor_stores_outstanding = 0;
+    m_ptx_tensor_acquire.reset();
+    for (auto &g : m_ptx_bulk_groups) g = cp_async_groups();
     m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
@@ -364,9 +372,19 @@ class shd_warp_t {
   void set_imiss_pending() { m_imiss_pending = true; }
   void clear_imiss_pending() { m_imiss_pending = false; }
 
+  unsigned m_ptx_tensor_pending = 0;
+  unsigned m_ptx_tensor_stores_outstanding = 0;
+  std::shared_ptr<ptx_tensor_transfer> m_ptx_tensor_acquire;
+  cp_async_groups m_ptx_bulk_groups[MAX_WARP_SIZE];
   bool m_ptx_mbarrier_pending = false;
   bool stores_done() const { return m_stores_outstanding == 0; }
-  void inc_store_req() { m_stores_outstanding++; }
+  bool ordinary_stores_done() const {
+    return m_stores_outstanding == m_ptx_tensor_stores_outstanding;
+  }
+  void inc_store_req(bool tensor = false) {
+    ++m_stores_outstanding;
+    if (tensor) ++m_ptx_tensor_stores_outstanding;
+  }
   void dec_store_req() {
     assert(m_stores_outstanding > 0);
     m_stores_outstanding--;
@@ -1867,6 +1885,17 @@ class ldst_unit : public pipelined_simd_unit {
 
   inline int get_sid() const { return m_sid; }
 
+  struct ptx_tensor_event {
+    uint64_t ready;
+    warp_inst_t inst;
+    unsigned target;
+  };
+  std::deque<ptx_tensor_event> m_ptx_tensor_events;
+  std::deque<warp_inst_t> m_ptx_tensor_descriptors;
+  uint64_t m_ptx_tensor_shared_available = 0;
+  void schedule_ptx_tensor(warp_inst_t &inst);
+  void service_ptx_tensor();
+
   // mbarrier management
   ClusterMbarriersLookupTable &get_mbarrier_table(dim3 cluster_id);
 
@@ -2798,6 +2827,14 @@ class shader_core_ctx : public core_t {
   void get_pdom_stack_top_info(unsigned tid, unsigned *pc, unsigned *rpc) const;
   float get_current_occupancy(unsigned long long &active,
                               unsigned long long &total) const;
+  void complete_ptx_tensor_read(warp_inst_t &inst) {
+    auto &t = *inst.m_ptx_tensor;
+    m_warp[inst.warp_id()]->m_ptx_bulk_groups[t.lane].complete(t.group);
+  }
+  void finish_ptx_tensor(unsigned warp_id) {
+    assert(m_warp[warp_id]->m_ptx_tensor_pending);
+    --m_warp[warp_id]->m_ptx_tensor_pending;
+  }
   void complete_ptx_mbarrier(unsigned warp_id) {
     m_warp[warp_id]->m_ptx_mbarrier_pending = false;
   }
@@ -2808,7 +2845,9 @@ class shader_core_ctx : public core_t {
   // modifiers
   void mem_instruction_stats(const warp_inst_t &inst);
   void decrement_atomic_count(unsigned wid, unsigned n);
-  void inc_store_req(unsigned warp_id) { m_warp[warp_id]->inc_store_req(); }
+  void inc_store_req(unsigned warp_id, bool tensor = false) {
+    m_warp[warp_id]->inc_store_req(tensor);
+  }
   void inc_tma_load_req(unsigned warp_id) {
     m_warp[warp_id]->inc_tma_load_req();
   }

@@ -576,6 +576,7 @@ std::string cuda_sim::ptx_get_insn_str(address_type pc) {
 
 void ptx_instruction::set_fp_or_int_archop() {
   oprnd_type = UN_OP;
+  if (is_tensor_ptx()) return;
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
@@ -604,6 +605,7 @@ void ptx_instruction::set_fp_or_int_archop() {
 
 void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
+  if (is_tensor_ptx()) return;
   if (m_opcode == ISSPACEP_OP || m_opcode == CLUSTER_ARRIVE_OP ||
       m_opcode == CLUSTER_WAIT_OP || m_opcode == MBARRIER_FENCE_OP)
     return;
@@ -814,6 +816,74 @@ void ptx_instruction::set_opcode_and_latency() {
       assert(!(has_memory_read() && has_memory_write()));
       if (has_memory_read()) op = LOAD_OP;
       if (has_memory_write()) op = STORE_OP;
+      break;
+    case TM_ADDRESS_OP:
+      m_ptx_tensor_op = PTX_TENSOR_ADDRESS;
+      op = SYNCS_OP;
+      space = shared_space;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      break;
+    case TM_DIM_OP:
+      m_ptx_tensor_op = PTX_TENSOR_DIM;
+      op = SYNCS_OP;
+      space = shared_space;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      break;
+    case TM_STRIDE_OP:
+      m_ptx_tensor_op = PTX_TENSOR_STRIDE;
+      op = SYNCS_OP;
+      space = shared_space;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      break;
+    case TM_PUBLISH_OP:
+      m_ptx_tensor_op = PTX_TENSOR_PUBLISH;
+      op = STORE_OP;
+      space = global_space;
+      cache_op = CACHE_GLOBAL;
+      data_size = 4;
+      memory_op = memory_store;
+      break;
+    case TM_ACQUIRE_OP:
+      m_ptx_tensor_op = PTX_TENSOR_ACQUIRE;
+      op = SYNCS_OP;
+      space = shared_space;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      break;
+    case ASYNC_FENCE_OP:
+      m_ptx_tensor_op = PTX_ASYNC_FENCE;
+      op = SYNCS_OP;
+      space = shared_space;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      break;
+    case TM_LOAD_OP:
+      m_ptx_tensor_op = PTX_TENSOR_LOAD;
+      op = TMA_OP;
+      space = global_space;
+      cache_op = CACHE_GLOBAL;
+      data_size = 2;
+      memory_op = memory_load;
+      break;
+    case TM_MULTICAST_OP:
+      m_ptx_tensor_op = PTX_TENSOR_MULTICAST;
+      op = TMA_OP;
+      space = global_space;
+      cache_op = CACHE_GLOBAL;
+      data_size = 2;
+      memory_op = memory_load;
+      break;
+    case TM_STORE_OP:
+      m_ptx_tensor_op = PTX_TENSOR_STORE;
+      op = TMA_OP;
+      space = global_space;
+      cache_op = CACHE_GLOBAL;
+      data_size = 2;
+      memory_op = memory_store;
+      break;
+    case BULK_COMMIT_OP:
+      m_ptx_tensor_op = PTX_BULK_COMMIT;
+      break;
+    case BULK_WAIT_OP:
+      m_ptx_tensor_op = PTX_BULK_WAIT;
       break;
     case MBARRIER_INIT_OP:
       m_ptx_mbarrier = true;
@@ -1266,7 +1336,7 @@ void ptx_instruction::pre_decode() {
         }
       }
     } else {
-      if ((m_opcode == CP_ASYNC_OP || m_ptx_mbarrier) &&
+      if ((m_opcode == CP_ASYNC_OP || m_ptx_mbarrier || is_tensor_ptx()) &&
           o.is_memory_operand()) {
         if (o.get_symbol()->type()->get_key().is_reg()) {
           in[m] = o.reg_num();
@@ -1934,7 +2004,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // Tensorcore is warp synchronous operation. So these instructions needs
       // to be executed only once. To make the simulation faster removing the
       // redundant tensorcore operation
-      if (!pI->m_ptx_mbarrier && !pI->is_cp_async() &&
+      if (!pI->m_ptx_mbarrier && !pI->is_tensor_ptx() && !pI->is_cp_async() &&
           !pI->is_warp_collective() &&
           (!tensorcore_op(inst_opcode) || lane_id == 0)) {
         switch (inst_opcode) {
@@ -1996,7 +2066,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     memory_space_t insn_space = undefined_space;
     _memory_op_t insn_memory_op = no_memory_op;
     unsigned insn_data_size = 0;
-    if (!pI->is_cp_async() &&
+    if (!pI->is_tensor_ptx() && !pI->is_cp_async() &&
         (pI->has_memory_read() || pI->has_memory_write())) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         insn_memaddr = last_eaddr();
@@ -2108,7 +2178,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
 
     // "Return values"
-    if (!skip && !pI->m_ptx_mbarrier && !pI->is_cp_async()) {
+    if (!skip && !pI->m_ptx_mbarrier && !pI->is_tensor_ptx() &&
+        !pI->is_cp_async()) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);

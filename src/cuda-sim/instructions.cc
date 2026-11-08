@@ -6835,11 +6835,124 @@ void mbarrier_complete(const warp_inst_t &inst, core_t *core,
         // GPGPU-Sim predicates use an inverted low (zero-flag) bit.
         result.pred =
             barrier->waiting_parity(operand.u.wait.phase[lane]) ? 1 : 0;
+        if (DTRACE(PTX_TMA))
+          printf(
+              "PTX_TMA wait cycle=%llu rank=%u address=%u phase=%u "
+              "success=%u\n",
+              core->get_gpu()->global_cycle(),
+              kernel.cluster_rank(thread->get_ctaid()), address,
+              unsigned(barrier->get_phase()), unsigned(!result.pred));
         thread->set_operand_value(p->dst(), result, PRED_TYPE, thread, p);
         break;
       }
       default:
         abort();
+    }
+  }
+}
+
+void tensor_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst) {
+  assert(!core->get_gpu()->is_functional_sim());
+  unsigned lane = 0;
+  while (!inst.active(lane)) ++lane;
+  auto *thread = core->get_thread_info()[inst.warp_id() * MAX_WARP_SIZE + lane];
+  auto value = [&](unsigned n, unsigned type = U64_TYPE) {
+    const auto &operand = p->operand_lookup(n);
+    return thread->get_operand_value(operand, operand, type, thread, 0).u64;
+  };
+  auto kind = inst.m_ptx_tensor_op;
+  if (kind == PTX_BULK_COMMIT || kind == PTX_ASYNC_FENCE) return;
+  if (kind == PTX_BULK_WAIT) {
+    inst.m_ptx_cp_async_wait = value(0, U32_TYPE);
+    return;
+  }
+  auto t = std::make_shared<ptx_tensor_transfer>();
+  inst.m_ptx_tensor = t;
+  t->kernel = &thread->get_kernel();
+  t->global = thread->get_global_memory();
+  t->source_shared = thread->m_shared_mem;
+  t->lane = lane;
+  if (kind == PTX_TENSOR_ADDRESS || kind == PTX_TENSOR_DIM ||
+      kind == PTX_TENSOR_STRIDE) {
+    t->shared_base = value(0, U32_TYPE);
+    t->source_shared->read(t->shared_base, 128, t->map.bytes);
+    if (kind == PTX_TENSOR_ADDRESS)
+      t->map.set<uint64_t>(0, value(1));
+    else if (kind == PTX_TENSOR_DIM)
+      t->map.set<uint32_t>(40 + 4 * value(1, U32_TYPE), value(2, U32_TYPE));
+    else
+      t->map.set<uint64_t>(8 + 8 * value(1, U32_TYPE), value(2));
+    return;  // Written at shared service, before this warp can continue.
+  }
+  if (kind == PTX_TENSOR_ACQUIRE) {
+    t->descriptor = value(0);
+    assert(value(1, U32_TYPE) == 128);
+    return;
+  }
+  if (kind == PTX_TENSOR_PUBLISH) {
+    assert(inst.active_count() == 32 && value(2, U32_TYPE) == 128);
+    t->descriptor = value(0);
+    t->shared_base = value(1, U32_TYPE);
+    // A single warp copy, distributed into 32 four-byte memory accesses.
+    for (unsigned i = 0; i < 32; ++i) inst.set_addr(i, t->descriptor + 4 * i);
+    return;
+  }
+  assert(inst.active_count() == 1);
+  bool store = kind == PTX_TENSOR_STORE;
+  unsigned descriptor_operand = store ? 0 : 1;
+  t->descriptor = value(descriptor_operand);
+  t->global->read(t->descriptor, 128, t->map.bytes);
+  assert(t->map.get<uint32_t>(100) == 2);
+  assert(t->map.get<uint32_t>(112) == 2 || t->map.get<uint32_t>(112) == 3);
+  const auto &coords = p->operand_lookup(descriptor_operand + 1);
+  t->x = thread->get_reg(coords.vec_symbol(0)).s32;
+  t->y = thread->get_reg(coords.vec_symbol(1)).s32;
+  t->shared_base = value(store ? 2 : 0, U32_TYPE) & 0xffffff;
+  unsigned bx = t->map.get<uint32_t>(60), by = t->map.get<uint32_t>(64);
+  assert((bx == 32 && by == 64) || (bx == 64 && (by == 64 || by == 128)));
+  t->data.resize(2 * bx * by, 0);
+  t->addresses.resize(bx * by, 0);
+  unsigned valid = 0;
+  for (unsigned v = 0; v < by; ++v) {
+    for (unsigned u = 0; u < bx; ++u) {
+      int64_t x = int64_t(t->x) + u, y = int64_t(t->y) + v;
+      if (x < 0 || y < 0 || x >= t->map.get<uint32_t>(40) ||
+          y >= t->map.get<uint32_t>(44))
+        continue;
+      unsigned i = v * bx + u;
+      new_addr_type addr =
+          t->map.get<uint64_t>(0) + 2 * x + t->map.get<uint64_t>(8) * y;
+      t->addresses[i] = addr;
+      inst.push_back_tma_access_addr(addr);
+      if (!store) t->global->read(addr, 2, &t->data[2 * i]);
+      valid += 2;
+    }
+  }
+  inst.set_tma_byte_count(t->data.size());
+  inst.set_tma_oob_byte_count(t->data.size() - valid);
+  if (!store) {
+    // Descriptor fetches share the existing sector/coalescing/return path.
+    for (unsigned i = 0; i < 128; i += 2)
+      inst.push_back_tma_access_addr(t->descriptor + i);
+    unsigned address = value(3, U32_TYPE);
+    auto &kernel = *t->kernel;
+    unsigned rank = kernel.cluster_rank(thread->get_ctaid());
+    unsigned mask =
+        kind == PTX_TENSOR_MULTICAST ? value(4, U32_TYPE) : 1 << rank;
+    auto id = kernel.cluster_id(thread->get_ctaid());
+    for (unsigned r = 0; r < 2; ++r) {
+      if (!(mask & (1 << r))) continue;
+      memory_space *shared = thread->m_shared_mem;
+      if (r != rank)
+        shared = kernel
+                     .resolve_cluster_shared(thread->get_ctaid(),
+                                             (r << 24) | t->shared_base)
+                     .shared;
+      auto *barrier =
+          kernel.get_cluster_mbarrier_lookup_table(id).lookup_clustermbar(
+              (r << 24) | (address & 0xffffff));
+      t->targets.push_back(
+          {shared, barrier, unsigned(barrier->get_phase()), r != rank});
     }
   }
 }

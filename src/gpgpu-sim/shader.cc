@@ -1089,6 +1089,52 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     }
   }
 
+  warp_inst_t &tensor_inst = **pipe_reg;
+  if (tensor_inst.m_ptx_tensor_op && tensor_inst.active_count()) {
+    auto &warp = *m_warp[warp_id];
+    auto kind = tensor_inst.m_ptx_tensor_op;
+    if (kind == PTX_BULK_COMMIT || kind == PTX_BULK_WAIT) {
+      for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+        if (!tensor_inst.active(lane)) continue;
+        if (kind == PTX_BULK_COMMIT)
+          warp.m_ptx_bulk_groups[lane].commit();
+        else
+          warp.m_ptx_bulk_groups[lane].wait(tensor_inst.m_ptx_cp_async_wait);
+        const auto &g = warp.m_ptx_bulk_groups[lane];
+        DPRINTF(PTX_TMA,
+                "PTX_TMA group kind=%u lane=%u committed=%llu cutoff=%llu "
+                "pending=%zu waiting=%u\n",
+                unsigned(kind), lane, g.committed, g.cutoff, g.pending.size(),
+                unsigned(g.waiting()));
+      }
+    } else if (kind == PTX_TENSOR_PUBLISH || tensor_inst.is_tma()) {
+      ++warp.m_ptx_tensor_pending;
+      auto &t = *tensor_inst.m_ptx_tensor;
+      t.pending = tensor_inst.accessq_count();
+      t.write_pending = t.pending;
+      DPRINTF(PTX_TMA,
+              "PTX_TMA issue uid=%u kind=%u requests=%u bytes=%zu oob=%zu "
+              "targets=%zu descriptor=%llx base=%llx\n",
+              tensor_inst.get_uid(), unsigned(kind), t.pending, t.data.size(),
+              tensor_inst.get_tma_oob_byte_count(), t.targets.size(),
+              t.descriptor, (unsigned long long)t.map.get<uint64_t>(0));
+      if (kind == PTX_TENSOR_STORE)
+        t.group = warp.m_ptx_bulk_groups[t.lane].add();
+      if (kind == PTX_TENSOR_PUBLISH)
+        t.kernel->ptx_tensor_publications[t.descriptor] += t.pending;
+    } else {
+      warp.m_ptx_mbarrier_pending = true;
+      if (kind == PTX_TENSOR_ACQUIRE)
+        warp.m_ptx_tensor_acquire = tensor_inst.m_ptx_tensor;
+    }
+  }
+
+  if (tensor_inst.space.get_type() == shared_space && tensor_inst.is_store() &&
+      m_warp[warp_id]->m_ptx_tensor_stores_outstanding)
+    DPRINTF(PTX_TMA, "PTX_TMA shared_reuse uid=%u outstanding=%u\n",
+            tensor_inst.get_uid(),
+            m_warp[warp_id]->m_ptx_tensor_stores_outstanding);
+
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
   warp_inst_t &issued = **pipe_reg;
@@ -1120,7 +1166,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   }
 
   // Start to track outstanding TMA stores
-  if (next_inst->is_tma_store()) {
+  if (next_inst->is_tma_store() && !next_inst->m_ptx_tensor_op) {
     // Need to get the issued instruction from the pipe register for uid
     // tracking and accessq_count()
     warp_inst_t *tma_inst = *pipe_reg;
@@ -1606,7 +1652,7 @@ void scheduler_unit::cycle() {
                 if (pI->m_ptx_mbarrier &&
                     (pI->is_syncs_arrive() ||
                      pI->get_syncs_op() == SYNCS_INIT_FENCE) &&
-                    (!warp(warp_id).stores_done() ||
+                    (!warp(warp_id).ordinary_stores_done() ||
                      m_scoreboard->pendingWrites(warp_id)))
                   break;
                 if (!pI->m_ptx_mbarrier && pI->is_syncs_try_wait() &&
@@ -2259,6 +2305,11 @@ bool ldst_unit::shared_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
   if (inst.space.get_type() != shared_space) return true;
 
   if (inst.active_count() == 0) return true;
+  if (m_core->get_gpu()->global_cycle() < m_ptx_tensor_shared_available) {
+    fail_type = S_MEM;
+    rc_fail = BK_CONF;
+    return false;
+  }
 
   if (inst.has_dispatch_delay()) {
     m_stats->gpgpu_n_shmem_bank_access[m_sid]++;
@@ -2287,7 +2338,8 @@ mem_stage_stall_type ldst_unit::process_cache_access(
                            : 1;
 
     for (unsigned i = 0; i < inc_ack; ++i)
-      m_core->inc_store_req(inst.warp_id());
+      m_core->inc_store_req(inst.warp_id(),
+                            inst.m_ptx_tensor && inst.is_tma_store());
   }
   if (status == HIT) {
     assert(!read_sent);
@@ -2376,7 +2428,8 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
                   : 1;
 
           for (unsigned i = 0; i < inc_ack; ++i)
-            m_core->inc_store_req(inst.warp_id());
+            m_core->inc_store_req(inst.warp_id(),
+                                  inst.m_ptx_tensor && inst.is_tma_store());
         }
 
         inst.accessq_pop_back();
@@ -2559,6 +2612,11 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
                        (inst.space.get_type() != param_space_local)))
     return true;
   if (inst.active_count() == 0) return true;
+  if (inst.m_ptx_tensor && inst.is_store() && !inst.m_ptx_tensor->read_done) {
+    stall_reason = COAL_STALL;
+    access_type = G_MEM_ST;
+    return false;
+  }
   if (inst.accessq_empty()) return true;
 
   mem_stage_stall_type stall_cond = NO_RC_FAIL;
@@ -2619,7 +2677,8 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
               assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
           if (access.is_tma()) m_core->inc_tma_load_req(inst.warp_id());
         } else if (inst.is_store())
-          m_core->inc_store_req(inst.warp_id());
+          m_core->inc_store_req(inst.warp_id(),
+                                inst.m_ptx_tensor && inst.is_tma_store());
       }
     }
   } else {
@@ -2999,7 +3058,15 @@ void ldst_unit::issue(register_set &reg_set) {
   inst->op_pipe = MEM__OP;
 
   // Update TMA oob byte count
-  if (inst->is_tma_load()) {
+  if (inst->m_ptx_tensor && inst->is_tma_store()) {
+    warp_inst_t descriptor = *inst;
+    descriptor.make_ptx_tensor_descriptor_read();
+    inst->m_ptx_tensor->descriptor_pending = descriptor.accessq_count();
+    m_ptx_tensor_descriptors.push_back(descriptor);
+  } else if (inst->m_ptx_tensor_op == PTX_TENSOR_PUBLISH &&
+             inst->active_count())
+    schedule_ptx_tensor(*inst);
+  if (inst->is_tma_load() && !inst->m_ptx_tensor) {
     if (inst->get_tma_oob_byte_count() > 0) {
       // If this TMA load is accessing oob, we need to update the mbarrier
       // counter properly ideally this should be done in the ::writeback()
@@ -3057,7 +3124,8 @@ bool ldst_unit::writeback_complete(warp_inst_t &inst) {
     }
   }
   if (insn_completed) {
-    if (inst.m_ptx_mbarrier) m_core->complete_ptx_mbarrier(inst.warp_id());
+    if (inst.m_ptx_mbarrier || inst.m_ptx_tensor_op)
+      m_core->complete_ptx_mbarrier(inst.warp_id());
     m_core->warp_inst_complete(inst);
     if (inst.m_is_ldgsts) {
       // If the LDGSTS instruction is done, we need to erase it from the
@@ -3133,7 +3201,21 @@ void ldst_unit::writeback() {
             }
             // Update TMA mbarrier state as this load returns
             const mem_access_t &access = mf->get_mem_access();
-            if (access.is_tma() && !access.is_write()) {
+            if (m_next_wb.m_ptx_tensor && m_next_wb.is_tma_load()) {
+              auto &t = *m_next_wb.m_ptx_tensor;
+              if (m_next_wb.m_ptx_tensor_op == PTX_TENSOR_STORE) {
+                assert(t.descriptor_pending);
+                if (--t.descriptor_pending == 0) {
+                  warp_inst_t source_read = m_next_wb;
+                  source_read.memory_op = memory_store;
+                  schedule_ptx_tensor(source_read);
+                }
+              } else {
+                assert(t.pending);
+                if (--t.pending == 0) schedule_ptx_tensor(m_next_wb);
+              }
+              m_core->dec_tma_load_req(mf->get_wid());
+            } else if (access.is_tma() && !access.is_write()) {
               // TMA load from global returns: complete the mbarrier by the
               // number of in-bounds bytes this access actually covers, NOT the
               // sector-rounded access size. The coalescer rounds an access up
@@ -3232,7 +3314,14 @@ void ldst_unit::writeback() {
               ClusterCTAIdentifier(syncs_inst->get_cuda_cluster_id(),
                                    syncs_inst->get_cuda_cluster_rank());
           unsigned sid = m_core->get_sid();
-          if (syncs_inst->m_ptx_mbarrier) {
+          if (syncs_inst->m_ptx_tensor_op) {
+            auto t = syncs_inst->m_ptx_tensor;
+            if (t && (syncs_inst->m_ptx_tensor_op == PTX_TENSOR_ADDRESS ||
+                      syncs_inst->m_ptx_tensor_op == PTX_TENSOR_DIM ||
+                      syncs_inst->m_ptx_tensor_op == PTX_TENSOR_STRIDE))
+              t->source_shared->write(t->shared_base, 128, t->map.bytes,
+                                      nullptr, nullptr);
+          } else if (syncs_inst->m_ptx_mbarrier) {
             mbarrier_complete(*syncs_inst, m_core, m_config->smem_latency);
           } else
             switch (op) {
@@ -3493,6 +3582,7 @@ inst->space.get_type() != shared_space) { unsigned warp_id = inst->warp_id();
 }
 */
 void ldst_unit::cycle() {
+  service_ptx_tensor();
   writeback();
 
   // Move warp in pipeline
@@ -3591,6 +3681,14 @@ void ldst_unit::cycle() {
     if (m_config->m_L1D_config.l1_latency > 0) L1_latency_queue_cycle();
   }
 
+  if (!m_ptx_tensor_descriptors.empty()) {
+    mem_stage_stall_type stall = NO_RC_FAIL;
+    mem_stage_access_type type;
+    if (memory_cycle(m_ptx_tensor_descriptors.front(), stall, type))
+      m_ptx_tensor_descriptors.pop_front();
+    // Descriptor and data requests use the same LSU injection port.
+    return;
+  }
   warp_inst_t &pipe_reg = *m_dispatch_reg;
   enum mem_stage_stall_type rc_fail = NO_RC_FAIL;
   mem_stage_access_type type;
@@ -5031,8 +5129,35 @@ void shader_core_ctx::store_ack(class mem_fetch *mf) {
   unsigned warp_id = mf->get_wid();
   // Decrement the number of outstanding store requests
   m_warp[warp_id]->dec_store_req();
-  // Decrement the number of outstanding TMA stores
-  if (mf->get_inst().is_tma_store()) {
+  const auto &inst = mf->get_inst();
+  if (inst.m_ptx_tensor && inst.is_tma_store()) {
+    assert(m_warp[warp_id]->m_ptx_tensor_stores_outstanding);
+    --m_warp[warp_id]->m_ptx_tensor_stores_outstanding;
+  }
+  if (inst.m_ptx_tensor && inst.is_store()) {
+    auto &t = *inst.m_ptx_tensor;
+    if (inst.m_ptx_tensor_op == PTX_TENSOR_PUBLISH) {
+      auto &count = t.kernel->ptx_tensor_publications.at(t.descriptor);
+      assert(count);
+      if (--count == 0) t.kernel->ptx_tensor_publications.erase(t.descriptor);
+    }
+    assert(t.write_pending);
+    if (--t.write_pending == 0) {
+      if (inst.m_ptx_tensor_op == PTX_TENSOR_PUBLISH)
+        t.global->write(t.descriptor, 128, t.map.bytes, nullptr, nullptr);
+      else {
+        for (unsigned i = 0; i < t.addresses.size(); ++i)
+          if (t.addresses[i])
+            t.global->write(t.addresses[i], 2, &t.data[2 * i], nullptr,
+                            nullptr);
+      }
+      DPRINTF(PTX_TMA, "PTX_TMA write_done uid=%u kind=%u\n", inst.get_uid(),
+              unsigned(inst.m_ptx_tensor_op));
+      finish_ptx_tensor(warp_id);
+    }
+  }
+  // Trace TMA keeps its original write-ack group semantics.
+  if (mf->get_inst().is_tma_store() && !inst.m_ptx_tensor) {
     DPRINTF(CORE_ISSUE,
             "Decrementing number of outstanding TMA stores, instruction m_uid: "
             "%d\n",
@@ -5082,12 +5207,20 @@ bool shd_warp_t::functional_done() const {
 bool shd_warp_t::hardware_done() const {
   for (const auto &groups : m_ptx_cp_async_groups)
     if (groups.outstanding()) return false;
-  return functional_done() && stores_done() && tma_loads_done() &&
-         !inst_in_pipeline();
+  return !m_ptx_tensor_pending && functional_done() && stores_done() &&
+         tma_loads_done() && !inst_in_pipeline();
 }
 
 bool shd_warp_t::waiting() {
   bool waiting = m_ptx_mbarrier_pending;
+  if (m_ptx_tensor_acquire) {
+    const auto &t = *m_ptx_tensor_acquire;
+    if (t.kernel->ptx_tensor_publications.count(t.descriptor))
+      waiting = true;
+    else
+      m_ptx_tensor_acquire.reset();
+  }
+  for (const auto &g : m_ptx_bulk_groups) waiting |= g.waiting();
   if (m_ptx_cluster_waiting) {
     auto *kernel = m_ptx_cluster_kernel;
     if (kernel->cluster_wait_ready(m_ptx_cluster_id, m_ptx_cluster_epoch)) {
@@ -6036,4 +6169,82 @@ void opndcoll_simple_t::dump(FILE *fp) const {
 void opndcoll_simple_t::add_port(port_vector_t &input, port_vector_t &output,
                                  uint_vector_t cu_sets) {
   m_in_ports.push_back(input_port_t(input, output, cu_sets));
+}
+
+// Reserve shared service by byte volume (32 banks x 4B per bank per service
+// step), then endpoint latency. All valid global responses precede input
+// delivery. Remote targets additionally traverse the cluster endpoint.
+void ldst_unit::schedule_ptx_tensor(warp_inst_t &inst) {
+  auto &t = *inst.m_ptx_tensor;
+  uint64_t now = m_core->get_gpu()->global_cycle();
+  unsigned bytes =
+      inst.m_ptx_tensor_op == PTX_TENSOR_PUBLISH ? 128 : t.data.size();
+  unsigned service = (bytes + m_config->num_shmem_bank * 4 - 1) /
+                     (m_config->num_shmem_bank * 4);
+  unsigned count = inst.is_tma_load() ? t.targets.size() : 1;
+  for (unsigned i = 0; i < count; ++i) {
+    m_ptx_tensor_shared_available =
+        std::max(now, m_ptx_tensor_shared_available) + service;
+    uint64_t ready = m_ptx_tensor_shared_available + m_config->smem_latency;
+    if (inst.is_tma_load() && t.targets[i].remote)
+      ready += m_config->smem_latency;
+    m_ptx_tensor_events.push_back({ready, inst, i});
+  }
+}
+
+void ldst_unit::service_ptx_tensor() {
+  uint64_t now = m_core->get_gpu()->global_cycle();
+  for (auto it = m_ptx_tensor_events.begin();
+       it != m_ptx_tensor_events.end();) {
+    if (it->ready > now) {
+      ++it;
+      continue;
+    }
+    auto &inst = it->inst;
+    auto &t = *inst.m_ptx_tensor;
+    if (DTRACE(PTX_TMA))
+      printf("PTX_TMA service cycle=%llu uid=%u kind=%u target=%u bytes=%zu\n",
+             (unsigned long long)now, inst.get_uid(),
+             unsigned(inst.m_ptx_tensor_op), it->target, t.data.size());
+    unsigned swizzle = t.map.get<uint32_t>(112);
+    if (inst.is_tma_load()) {
+      auto &target = t.targets[it->target];
+      assert(unsigned(target.barrier->get_phase()) == target.phase);
+      for (unsigned i = 0; i < t.data.size(); i += 2) {
+        unsigned addr = ptx_tensor_shared_address(t.shared_base, i, swizzle);
+        target.shared->write(addr, 2, &t.data[i], nullptr, nullptr);
+      }
+      target.barrier->complete_on(t.data.size());
+      if (DTRACE(PTX_TMA))
+        printf(
+            "PTX_TMA delivered cycle=%llu uid=%u rank=%u phase=%u bytes=%zu\n",
+            (unsigned long long)now, inst.get_uid(),
+            target.barrier->get_cluster_cta_identifier().cluster_rank,
+            unsigned(target.barrier->get_phase()), t.data.size());
+      // pending responses are already zero; use the target marker to retire
+      // only after all destinations have received data, even when rank0 exits.
+      target.shared = nullptr;
+      bool done = true;
+      for (const auto &dest : t.targets) done &= dest.shared == nullptr;
+      if (done) m_core->finish_ptx_tensor(inst.warp_id());
+    } else {
+      if (inst.m_ptx_tensor_op == PTX_TENSOR_PUBLISH)
+        t.source_shared->read(t.shared_base, 128, t.map.bytes);
+      else {
+        for (unsigned i = 0; i < t.data.size(); i += 2) {
+          unsigned addr = ptx_tensor_shared_address(t.shared_base, i, swizzle);
+          t.source_shared->read(addr, 2, &t.data[i]);
+        }
+        m_core->complete_ptx_tensor_read(inst);
+      }
+      t.read_done = true;
+      if (DTRACE(PTX_TMA))
+        printf("PTX_TMA read_done cycle=%llu uid=%u kind=%u\n",
+               (unsigned long long)now, inst.get_uid(),
+               unsigned(inst.m_ptx_tensor_op));
+      // All-OOB output has no acknowledgements but still reads its source.
+      if (!t.write_pending) m_core->finish_ptx_tensor(inst.warp_id());
+    }
+    it = m_ptx_tensor_events.erase(it);
+  }
 }
