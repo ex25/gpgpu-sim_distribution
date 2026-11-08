@@ -60,6 +60,7 @@ class Scoreboard {
   // keeps track of pending writes to registers
   // indexed by warp id, reg_id => pending write count
   std::vector<std::unordered_set<unsigned> > reg_table;
+  std::vector<std::map<unsigned, unsigned>> matrix_writers;
   // Register that depend on a long operation (global, local or tex memory)
   std::vector<std::set<unsigned> > longopregs;
 

@@ -152,6 +152,10 @@ class shd_warp_t {
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
     m_ptx_mbarrier_pending = false;
+    m_ptx_matrix_sequence = m_ptx_matrix_control = m_ptx_matrix_written = 0;
+    m_ptx_matrix_group.reset();
+    m_ptx_matrix_sync.reset();
+    m_ptx_matrix_rendezvous.reset();
     m_ptx_tensor_pending = 0;
     m_ptx_tensor_stores_outstanding = 0;
     m_ptx_tensor_acquire.reset();
@@ -213,6 +217,10 @@ class shd_warp_t {
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
     m_ptx_mbarrier_pending = false;
+    m_ptx_matrix_sequence = m_ptx_matrix_control = m_ptx_matrix_written = 0;
+    m_ptx_matrix_group.reset();
+    m_ptx_matrix_sync.reset();
+    m_ptx_matrix_rendezvous.reset();
     m_ptx_tensor_pending = 0;
     m_ptx_tensor_stores_outstanding = 0;
     m_ptx_tensor_acquire.reset();
@@ -372,6 +380,11 @@ class shd_warp_t {
   void set_imiss_pending() { m_imiss_pending = true; }
   void clear_imiss_pending() { m_imiss_pending = false; }
 
+  unsigned m_ptx_matrix_sequence = 0, m_ptx_matrix_control = 0;
+  unsigned m_ptx_matrix_written = 0;
+  std::shared_ptr<ptx_matrix_warpgroup> m_ptx_matrix_group;
+  std::shared_ptr<ptx_matrix_sync> m_ptx_matrix_sync;
+  std::shared_ptr<ptx_matrix_op> m_ptx_matrix_rendezvous;
   unsigned m_ptx_tensor_pending = 0;
   unsigned m_ptx_tensor_stores_outstanding = 0;
   std::shared_ptr<ptx_tensor_transfer> m_ptx_tensor_acquire;
@@ -1775,12 +1788,7 @@ class specialized_unit : public pipelined_simd_unit {
   specialized_unit(register_set *result_port, const shader_core_config *config,
                    shader_core_ctx *core, int supported_op, char *unit_name,
                    unsigned latency, unsigned issue_reg_id);
-  virtual bool can_issue(const warp_inst_t &inst) const {
-    if (inst.op != m_supported_op) {
-      return false;
-    }
-    return pipelined_simd_unit::can_issue(inst);
-  }
+  virtual bool can_issue(const warp_inst_t &inst) const;
   virtual void active_lanes_in_pipeline();
   virtual void issue(register_set &source_reg);
   bool is_issue_partitioned() { return true; }
@@ -2047,6 +2055,7 @@ class ldst_unit : public pipelined_simd_unit {
   void get_cache_stats(unsigned &read_accesses, unsigned &write_accesses,
                        unsigned &read_misses, unsigned &write_misses,
                        unsigned cache_type);
+  uint64_t reserve_ptx_matrix_shared(unsigned bytes);
   void get_cache_stats(cache_stats &cs);
 
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
@@ -3311,6 +3320,9 @@ class shader_core_ctx : public core_t {
   // Jin: concurrent kernels on a sm
  public:
   uint64_t m_last_cta_issue_cycle = uint64_t(-1);
+  std::map<unsigned, ptx_matrix_cta> m_ptx_matrix_ctas;
+  void issue_ptx_matrix(warp_inst_t &inst);
+  bool prepare_ptx_matrix(const warp_inst_t &inst);
   bool can_issue_1block(kernel_info_t &kernel);
   bool occupy_shader_resource_1block(kernel_info_t &kernel, bool occupy);
   void release_shader_resource_1block(unsigned hw_ctaid, kernel_info_t &kernel);

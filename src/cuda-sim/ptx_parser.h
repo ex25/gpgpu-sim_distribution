@@ -130,6 +130,10 @@ class ptx_recognizer {
   void add_1vector_operand(const char *d1);
   void add_2vector_operand(const char *d1, const char *d2);
   void add_3vector_operand(const char *d1, const char *d2, const char *d3);
+  std::vector<const symbol *> m_tuple;
+  void begin_tuple() { m_tuple.clear(); }
+  void tuple_element(const char *name);
+  void end_tuple();
   void add_4vector_operand(const char *d1, const char *d2, const char *d3,
                            const char *d4);
   void add_8vector_operand(const char *d1, const char *d2, const char *d3,
@@ -139,7 +143,7 @@ class ptx_recognizer {
   void add_wmma_option(int option);
   void add_builtin_operand(int builtin, int dim_modifier);
   void add_memory_operand();
-  void add_literal_int(int value);
+  void add_literal_int(long long value);
   void add_literal_float(float value);
   void add_literal_double(double value);
   void add_address_operand(const char *identifier, int offset);

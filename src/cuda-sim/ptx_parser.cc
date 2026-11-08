@@ -873,7 +873,7 @@ void ptx_recognizer::change_operand_neg() {
   g_operands.back().set_operand_neg();
 }
 
-void ptx_recognizer::add_literal_int(int value) {
+void ptx_recognizer::add_literal_int(long long value) {
   PTX_PARSE_DPRINTF("add_literal_int");
   g_operands.push_back(operand_info(value, gpgpu_ctx));
 }
@@ -1004,3 +1004,20 @@ void ptx_recognizer::func_header_info(const char *a) {
 }  // intentional dummy function
 void ptx_recognizer::func_header_info_int(const char *a, int b) {
 }  // intentional dummy function
+
+void ptx_recognizer::tuple_element(const char *name) {
+  const symbol *reg = g_current_symbol_table->lookup(name);
+  parse_assert(reg != nullptr, "tuple register missing declaration");
+  m_tuple.push_back(reg);
+}
+void ptx_recognizer::end_tuple() {
+  if (m_tuple.size() == 1 &&
+      (g_opcode == LD_OP || g_opcode == LDU_OP || g_opcode == ST_OP)) {
+    g_operands.push_back(operand_info(m_tuple[0], gpgpu_ctx));
+  } else {
+    const symbol *null_op = g_current_symbol_table->lookup("_");
+    for (auto &reg : m_tuple)
+      if (reg == null_op) reg = nullptr;
+    g_operands.push_back(operand_info(m_tuple, gpgpu_ctx));
+  }
+}

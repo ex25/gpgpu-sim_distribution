@@ -75,6 +75,14 @@ bar 	TC; yylval->int_value = BAR_OP; return OPCODE;
 barrier	TC; yylval->int_value = BAR_OP; return OPCODE;
 barrier.cluster.arrive.relaxed.aligned TC; yylval->int_value = CLUSTER_ARRIVE_OP; return OPCODE;
 barrier.cluster.wait.aligned TC; yylval->int_value = CLUSTER_WAIT_OP; return OPCODE;
+ldmatrix\.sync\.aligned\.x4\.m8n8\.shared\.b16 TC; yylval->int_value = LDMATRIX_OP; return OPCODE;
+stmatrix\.sync\.aligned\.x4\.m8n8\.shared\.b16 TC; yylval->int_value = STMATRIX_OP; return OPCODE;
+wgmma\.mma_async\.sync\.aligned\.m64n128k16\.f32\.bf16\.bf16 TC; yylval->int_value = WGMMA_OP; return OPCODE;
+wgmma\.fence\.sync\.aligned TC; yylval->int_value = WGMMA_FENCE_OP; return OPCODE;
+wgmma\.commit_group\.sync\.aligned TC; yylval->int_value = WGMMA_COMMIT_OP; return OPCODE;
+wgmma\.wait_group\.sync\.aligned TC; yylval->int_value = WGMMA_WAIT_OP; return OPCODE;
+setmaxnreg\.dec\.sync\.aligned\.u32 TC; yylval->int_value = SETMAX_DEC_OP; return OPCODE;
+setmaxnreg\.inc\.sync\.aligned\.u32 TC; yylval->int_value = SETMAX_INC_OP; return OPCODE;
 tensormap\.replace\.tile\.global_address\.shared::cta\.b1024\.b64 TC; yylval->int_value = TM_ADDRESS_OP; return OPCODE;
 tensormap\.replace\.tile\.global_dim\.shared::cta\.b1024\.b32 TC; yylval->int_value = TM_DIM_OP; return OPCODE;
 tensormap\.replace\.tile\.global_stride\.shared::cta\.b1024\.b64 TC; yylval->int_value = TM_STRIDE_OP; return OPCODE;
@@ -296,10 +304,21 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 [0-9]+\.[0-9]+ 	 TC; sscanf(yytext,"%lf", &yylval->double_value); return DOUBLE_OPERAND;
 	
-0[xX][0-9a-fA-F]+U? TC; CHECK_UNSIGNED; sscanf(yytext,"%x", &yylval->int_value); return INT_OPERAND;
+0[xX][0-9a-fA-F]+U? TC; CHECK_UNSIGNED; {
+  unsigned long long value = strtoull(yytext, nullptr, 16);
+  if (value > 0xffffffffULL) { yylval->int64_value = value; return INT64_OPERAND; }
+  yylval->int_value = value; return INT_OPERAND;
+}
 0[0-7]+U?   	TC; printf("GPGPU-Sim: ERROR ** parsing octal not (yet) implemented\n"); abort(); return INT_OPERAND;
 0[bB][01]+U?  	TC; printf("GPGPU-Sim: ERROR ** parsing binary not (yet) implemented\n"); abort(); return INT_OPERAND;
-[-]?[0-9]+U?    TC; CHECK_UNSIGNED; yylval->int_value =  atoi(yytext); return INT_OPERAND;
+[-]?[0-9]+U?    TC; CHECK_UNSIGNED; {
+  long long value = yytext[0] == '-' ? strtoll(yytext, nullptr, 10) :
+                                    (long long)strtoull(yytext, nullptr, 10);
+  if (value < -2147483648LL || value > 2147483647LL) {
+    yylval->int64_value = value; return INT64_OPERAND;
+  }
+  yylval->int_value = value; return INT_OPERAND;
+}
 
 0[fF][0-9a-fA-F]{8}  TC; sscanf(yytext+2,"%x", (unsigned*)(void*)&yylval->float_value); return FLOAT_OPERAND;
 0[dD][0-9a-fA-F]{16}  TC; sscanf(yytext+2,"%Lx", (unsigned long long*)(void*)&yylval->double_value); return DOUBLE_OPERAND;

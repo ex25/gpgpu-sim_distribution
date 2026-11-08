@@ -6956,3 +6956,130 @@ void tensor_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst) {
     }
   }
 }
+
+// Lane distribution is independent of the virtual register numbers in a tuple.
+void matrix_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst) {
+  assert(!core->get_gpu()->is_functional_sim());
+  assert(inst.active_count() == 32);
+  auto **threads = core->get_thread_info() + inst.warp_id() * 32;
+  auto value = [&](unsigned lane, unsigned n, unsigned type) {
+    const auto &o = p->operand_lookup(n);
+    return threads[lane]->get_operand_value(o, o, type, threads[lane], 0);
+  };
+  unsigned kind = inst.m_ptx_matrix;
+  if (kind <= PTX_STMATRIX) {
+    unsigned address[32];
+    unsigned addr_operand = kind == PTX_LDMATRIX ? 1 : 0;
+    for (unsigned l = 0; l < 32; ++l)
+      address[l] = value(l, addr_operand, U32_TYPE).u32;
+    const auto &tuple = p->operand_lookup(kind == PTX_LDMATRIX ? 0 : 1);
+    for (unsigned l = 0; l < 32; ++l) {
+      new_addr_type accesses[4];
+      for (unsigned q = 0; q < 4; ++q) {
+        unsigned addr = address[8 * q + l / 4] + 4 * (l % 4);
+        ptx_reg_t data;
+        if (kind == PTX_LDMATRIX) {
+          threads[l]->m_shared_mem->read(addr, 4, &data.u32);
+          threads[l]->set_reg(tuple.vec_symbol(q), data);
+        } else {
+          data = threads[l]->get_reg(tuple.vec_symbol(q));
+          threads[l]->m_shared_mem->write(addr, 4, &data.u32, threads[l], p);
+        }
+        accesses[q] = addr;
+      }
+      inst.set_addr(l, accesses, 4);
+    }
+    return;
+  }
+  if (kind == PTX_WGMMA) {
+    auto w = std::make_shared<ptx_matrix_warp>();
+    inst.m_ptx_matrix_values = w;
+    w->a = value(0, 1, B64_TYPE).u64;
+    w->b = value(0, 2, B64_TYPE).u64;
+    w->scale = !(value(0, 3, PRED_TYPE).pred & 1);
+    assert(value(0, 4, U32_TYPE).u32 == 1);
+    assert(value(0, 5, U32_TYPE).u32 == 1);
+    assert(value(0, 6, U32_TYPE).u32 == 0);
+    assert(value(0, 7, U32_TYPE).u32 == 0);
+    for (unsigned j = 0; j < 64; ++j) w->dst[j] = p->dst().vec_symbol(j);
+    for (unsigned l = 0; l < 32; ++l) {
+      w->threads[l] = threads[l];
+    }
+  } else if (kind >= PTX_WGMMA_WAIT) {
+    inst.m_ptx_matrix_arg = value(0, 0, U32_TYPE).u32;
+  }
+}
+
+// Decode the K-major descriptor relative to its submatrix start. In swizzled
+// layouts the low start bits already name a swizzled 16B block. XOR only the
+// change in row phase; base_offset supplies the phase at the pattern boundary.
+static unsigned matrix_address(uint64_t d, unsigned row, unsigned k) {
+  unsigned start = (d & 0x3fff) << 4;
+  unsigned lbo = ((d >> 16) & 0x3fff) << 4;
+  unsigned sbo = ((d >> 32) & 0x3fff) << 4;
+  unsigned mode = d >> 62;
+  if (!mode)
+    return start + (row % 8) * 16 + (row / 8) * sbo + 2 * (k % 8) +
+           (k / 8) * lbo;
+  unsigned width = mode == 1 ? 128 : mode == 2 ? 64 : 32;
+  unsigned mask = width / 16 - 1;
+  unsigned phase = (d >> 49) & 7;
+  unsigned u = (row % 8) * width + (row / 8) * sbo + 2 * k;
+  unsigned origin = phase * 128 + ((start & 127) ^ ((phase & mask) << 4));
+  return start + ptx_shared_swizzle(origin + u, mask) -
+         ptx_shared_swizzle(origin, mask);
+}
+
+void ptx_matrix_op::compute() {
+  float a[64][16], b[128][16];
+  auto *mem = warps[0]->threads[0]->m_shared_mem;
+  auto read = [&](uint64_t desc, unsigned r, unsigned k) {
+    ptx_reg_t v;
+    uint16_t bits;
+    mem->read(matrix_address(desc, r, k), 2, &bits);
+    v.u32 = unsigned(bits) << 16;
+    return v.f32;
+  };
+  for (unsigned m = 0; m < 64; ++m)
+    for (unsigned k = 0; k < 16; ++k) a[m][k] = read(warps[0]->a, m, k);
+  for (unsigned n = 0; n < 128; ++n)
+    for (unsigned k = 0; k < 16; ++k) b[n][k] = read(warps[0]->b, n, k);
+  for (unsigned t = 0; t < 128; ++t) {
+    unsigned w = t / 32, l = t % 32;
+    for (unsigned j = 0; j < 64; ++j) {
+      unsigned m = 16 * w + l / 4 + 8 * ((j % 4) / 2);
+      unsigned n = 8 * (j / 4) + 2 * (l % 4) + j % 2;
+      float sum = 0;
+      if (warps[w]->scale)
+        sum = source[j] ? source[j]->result[t * 64 + source_index[j]]
+                        : warps[w]->initial[l * 64 + j];
+      for (unsigned k = 0; k < 16; ++k) sum = fmaf(a[m][k], b[n][k], sum);
+      result[t * 64 + j] = sum;
+    }
+  }
+  for (auto &previous : source) previous.reset();
+  computed = true;
+}
+void ptx_matrix_op::writeback(unsigned w) {
+  assert(computed && (pending & (1 << w)));
+  for (unsigned l = 0; l < 32; ++l)
+    for (unsigned j = 0; j < 64; ++j) {
+      ptx_reg_t value;
+      value.f32 = result[(w * 32 + l) * 64 + j];
+      warps[w]->threads[l]->set_reg(warps[w]->dst[j], value);
+    }
+  pending &= ~(1 << w);
+}
+void ptx_matrix_cta::allocate() {
+  for (auto &item : groups) {
+    auto &g = *item.second;
+    if (!g.quota_request) continue;
+    unsigned requested = g.quota_request->argument;
+    unsigned amount = 128 * (requested - g.quota);
+    if (amount > free) continue;
+    free -= amount;
+    g.quota = requested;
+    g.quota_request->released = true;
+    g.quota_request.reset();
+  }
+}

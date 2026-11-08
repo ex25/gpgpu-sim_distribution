@@ -43,6 +43,7 @@ class ptx_recognizer;
   double double_value;
   float  float_value;
   int    int_value;
+  long long int64_value;
   char * string_value;
   void * ptr_value;
 }
@@ -91,6 +92,7 @@ class ptx_recognizer;
 %token  WEAK_DIRECTIVE
 %token  <string_value> IDENTIFIER
 %token  <int_value> INT_OPERAND
+%token  <int64_value> INT64_OPERAND
 %token  <float_value> FLOAT_OPERAND
 %token  <double_value> DOUBLE_OPERAND
 %token  S8_TYPE
@@ -625,12 +627,9 @@ operand: IDENTIFIER  { recognizer->add_scalar_operand( $1 ); }
 	| IDENTIFIER BACKSLASH IDENTIFIER HI_OPTION { recognizer->add_2vector_operand($1,$3); recognizer->change_double_operand_type(-3); recognizer->change_operand_lohi(2);}
 	;
 
-vector_operand: LEFT_BRACE IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_2vector_operand($2,$4); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_3vector_operand($2,$4,$6); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_4vector_operand($2,$4,$6,$8); }
-		| LEFT_BRACE IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER COMMA IDENTIFIER RIGHT_BRACE { recognizer->add_8vector_operand($2,$4,$6,$8,$10,$12,$14,$16); }
-		| LEFT_BRACE IDENTIFIER RIGHT_BRACE { recognizer->add_1vector_operand($2); }
-	;
+vector_operand: LEFT_BRACE { recognizer->begin_tuple(); } tuple_elements RIGHT_BRACE { recognizer->end_tuple(); };
+tuple_elements: IDENTIFIER { recognizer->tuple_element($1); }
+              | tuple_elements COMMA IDENTIFIER { recognizer->tuple_element($3); };
 
 tex_operand: LEFT_SQUARE_BRACKET IDENTIFIER COMMA { recognizer->add_scalar_operand($2); }
 		vector_operand 
@@ -658,6 +657,7 @@ twin_operand : IDENTIFIER PLUS IDENTIFIER { recognizer->add_double_operand($1,$3
 	;
 
 literal_operand : INT_OPERAND { recognizer->add_literal_int($1); }
+        | INT64_OPERAND { recognizer->add_literal_int($1); }
 	| FLOAT_OPERAND { recognizer->add_literal_float($1); }
 	| DOUBLE_OPERAND { recognizer->add_literal_double($1); }
 	;

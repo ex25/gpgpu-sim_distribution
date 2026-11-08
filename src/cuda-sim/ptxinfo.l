@@ -51,6 +51,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %}
 
 %%
+"ptxas info    : (C7508)"[^\n]*
+"ptxas info    : (C7515)"[^\n]*
+"ptxas info    : (C7519)"[^\n]*
 "ptxas info    : Function properties for"[^\n]*\n[^\n]*
 "warning"[^\n]* TC; return WARNING;
 "ptxas"	TC; 	return HEADER;

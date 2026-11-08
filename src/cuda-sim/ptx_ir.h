@@ -519,7 +519,8 @@ class operand_info {
     m_is_return_var = false;
     m_immediate_address = true;
   }
-  operand_info(int x, gpgpu_context *ctx) {
+  operand_info(int x, gpgpu_context *ctx) : operand_info((long long)x, ctx) {}
+  operand_info(long long x, gpgpu_context *ctx) {
     init(ctx);
     m_is_non_arch_reg = false;
     m_addr_space = undefined_space;
@@ -586,7 +587,7 @@ class operand_info {
     m_valid = true;
     m_vector = true;
     m_type = vector_t;
-    m_value.m_vector_symbolic = new const symbol *[8];
+    m_value.m_vector_symbolic = new const symbol *[65] {};
     m_value.m_vector_symbolic[0] = s1;
     m_value.m_vector_symbolic[1] = s2;
     m_value.m_vector_symbolic[2] = s3;
@@ -614,7 +615,7 @@ class operand_info {
     m_valid = true;
     m_vector = true;
     m_type = vector_t;
-    m_value.m_vector_symbolic = new const symbol *[8];
+    m_value.m_vector_symbolic = new const symbol *[65] {};
     m_value.m_vector_symbolic[0] = s1;
     m_value.m_vector_symbolic[1] = s2;
     m_value.m_vector_symbolic[2] = s3;
@@ -627,6 +628,12 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+  }
+
+  operand_info(const std::vector<const symbol *> &regs, gpgpu_context *ctx)
+      : operand_info(nullptr, nullptr, nullptr, nullptr, ctx) {
+    assert(regs.size() <= 64);
+    std::copy(regs.begin(), regs.end(), m_value.m_vector_symbolic);
   }
 
   void init(gpgpu_context *ctx) {
@@ -669,19 +676,13 @@ class operand_info {
 
   unsigned get_vect_nelem() const {
     assert(is_vector());
-    if (!m_value.m_vector_symbolic[0]) return 0;
-    if (!m_value.m_vector_symbolic[1]) return 1;
-    if (!m_value.m_vector_symbolic[2]) return 2;
-    if (!m_value.m_vector_symbolic[3]) return 3;
-    if (!m_value.m_vector_symbolic[4]) return 4;
-    if (!m_value.m_vector_symbolic[5]) return 5;
-    if (!m_value.m_vector_symbolic[6]) return 6;
-    if (!m_value.m_vector_symbolic[7]) return 7;
-    return 8;
+    unsigned n = 0;
+    while (n < 64 && m_value.m_vector_symbolic[n]) ++n;
+    return n;
   }
 
   const symbol *vec_symbol(int idx) const {
-    assert(idx < 8);
+    assert(idx < 64);
     const symbol *result = m_value.m_vector_symbolic[idx];
     assert(result != NULL);
     return result;
@@ -870,7 +871,7 @@ class operand_info {
   bool m_operand_neg;
   addr_t m_const_mem_offset;
   union {
-    int m_int;
+    long long m_int;
     unsigned int m_unsigned;
     float m_float;
     double m_double;
@@ -1093,6 +1094,9 @@ class ptx_instruction : public warp_inst_t {
   unsigned dimension() const { return m_geom_spec; }
   bool is_sync() const { return m_sync; }
   bool is_warp_barrier() const { return m_opcode == BAR_OP && m_warp_scope; }
+  bool is_matrix_ptx() const {
+    return m_opcode >= LDMATRIX_OP && m_opcode <= SETMAX_INC_OP;
+  }
   bool is_tensor_ptx() const {
     return m_opcode >= TM_ADDRESS_OP && m_opcode <= BULK_WAIT_OP;
   }
@@ -1115,7 +1119,8 @@ class ptx_instruction : public warp_inst_t {
 
   bool has_memory_read() const {
     if (m_opcode == LD_OP || m_opcode == LDU_OP || m_opcode == TEX_OP ||
-        m_opcode == MMA_LD_OP || m_opcode == CP_ASYNC_OP)
+        m_opcode == MMA_LD_OP || m_opcode == CP_ASYNC_OP ||
+        m_opcode == LDMATRIX_OP)
       return true;
     // Check PTXPlus operand type below
     // Source operands are memory operands
@@ -1127,7 +1132,8 @@ class ptx_instruction : public warp_inst_t {
     return false;
   }
   bool has_memory_write() const {
-    if (m_opcode == ST_OP || m_opcode == MMA_ST_OP) return true;
+    if (m_opcode == ST_OP || m_opcode == MMA_ST_OP || m_opcode == STMATRIX_OP)
+      return true;
     // Check PTXPlus operand type below
     // Destination operand is a memory operand
     ptx_instruction::const_iterator op = op_iter_begin();

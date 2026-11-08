@@ -1089,6 +1089,8 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     }
   }
 
+  if ((*pipe_reg)->m_ptx_matrix >= PTX_WGMMA) issue_ptx_matrix(**pipe_reg);
+
   warp_inst_t &tensor_inst = **pipe_reg;
   if (tensor_inst.m_ptx_tensor_op && tensor_inst.active_count()) {
     auto &warp = *m_warp[warp_id];
@@ -1185,7 +1187,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   }
 
   // Start to track outstanding GMMA
-  if (next_inst->is_gmma()) {
+  if (next_inst->is_gmma() && !next_inst->m_ptx_matrix_op) {
     // Need to get the issued instruction from the pipe register for uid
     // tracking and accessq_count()
     warp_inst_t *gmma_inst = *pipe_reg;
@@ -2259,33 +2261,31 @@ void shader_core_ctx::writeback() {
   m_stats->m_last_num_sim_insn[m_sid] = m_stats->m_num_sim_insn[m_sid];
   m_stats->m_last_num_sim_winsn[m_sid] = m_stats->m_num_sim_winsn[m_sid];
 
-  warp_inst_t **preg = m_pipeline_reg[EX_WB].get_ready();
-  warp_inst_t *pipe_reg = (preg == NULL) ? NULL : *preg;
-  while (preg and !pipe_reg->empty()) {
-    /*
-     * Right now, the writeback stage drains all waiting instructions
-     * assuming there are enough ports in the register file or the
-     * conflicts are resolved at issue.
-     */
-
-    // Decrement the outstanding GMMA instruction
-    if (pipe_reg->is_gmma()) {
+  for (auto *pipe_reg : m_pipeline_reg[EX_WB].get_regs()) {
+    if (pipe_reg->empty()) continue;
+    if (pipe_reg->m_ptx_matrix_op &&
+        pipe_reg->m_ptx_matrix_sequence !=
+            m_warp[pipe_reg->warp_id()]->m_ptx_matrix_written)
+      continue;
+    // Keep the result at EX_WB until every physical bank service has finished.
+    if (!m_operand_collector->writeback(*pipe_reg)) continue;
+    if (pipe_reg->m_ptx_matrix_op) {
+      auto op = pipe_reg->m_ptx_matrix_op;
+      op->writeback(pipe_reg->m_ptx_matrix_warp);
+      ++m_warp[pipe_reg->warp_id()]->m_ptx_matrix_written;
+      if (DTRACE(PTX_TMA))
+        printf(
+            "PTX_GMMA writeback cycle=%llu uid=%u seq=%u warp=%u pending=%u\n",
+            m_gpu->global_cycle(), pipe_reg->get_uid(),
+            pipe_reg->m_ptx_matrix_sequence, pipe_reg->m_ptx_matrix_warp,
+            op->pending);
+      if (!op->pending)
+        pipe_reg->m_ptx_matrix_group->operations.erase(
+            pipe_reg->m_ptx_matrix_sequence);
+    } else if (pipe_reg->is_gmma()) {
       m_warp[pipe_reg->warp_id()]->dec_gmma_outstanding(pipe_reg->get_uid());
     }
 
-    /*
-     * The operand collector writeback can generally generate a stall
-     * However, here, the pipelines should be un-stallable. This is
-     * guaranteed because this is the first time the writeback function
-     * is called after the operand collector's step function, which
-     * resets the allocations. There is one case which could result in
-     * the writeback function returning false (stall), which is when
-     * an instruction tries to modify two registers (GPR and predicate)
-     * To handle this case, we ignore the return value (thus allowing
-     * no stalling).
-     */
-
-    m_operand_collector->writeback(*pipe_reg);
     unsigned warp_id = pipe_reg->warp_id();
     m_scoreboard->releaseRegisters(pipe_reg);
     m_warp[warp_id]->dec_inst_in_pipeline();
@@ -2295,8 +2295,6 @@ void shader_core_ctx::writeback() {
     m_last_inst_gpu_sim_cycle = m_gpu->gpu_sim_cycle;
     m_last_inst_gpu_tot_sim_cycle = m_gpu->gpu_tot_sim_cycle;
     pipe_reg->clear();
-    preg = m_pipeline_reg[EX_WB].get_ready();
-    pipe_reg = (preg == NULL) ? NULL : *preg;
   }
 }
 
@@ -2883,6 +2881,11 @@ void specialized_unit ::issue(register_set &source_reg) {
       source_reg.get_ready(m_config->sub_core_model, m_issue_reg_id);
   // m_core->incexecstat((*ready_reg));
   (*ready_reg)->op_pipe = SPECIALIZED__OP;
+  if ((*ready_reg)->m_ptx_matrix_op && DTRACE(PTX_TMA))
+    printf("PTX_GMMA dispatch cycle=%llu uid=%u seq=%u warp=%u\n",
+           m_core->get_gpu()->global_cycle(), (*ready_reg)->get_uid(),
+           (*ready_reg)->m_ptx_matrix_sequence,
+           (*ready_reg)->m_ptx_matrix_warp);
   m_core->incsp_stat(m_core->get_config()->warp_size, (*ready_reg)->latency);
   pipelined_simd_unit::issue(source_reg);
 }
@@ -4033,6 +4036,7 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
   assert(m_cta_status[cta_num] > 0);
   m_cta_status[cta_num]--;
   if (!m_cta_status[cta_num]) {
+    m_ptx_matrix_ctas.erase(cta_num);
     // Increment the completed CTAs
     m_stats->ctas_completed++;
     m_gpu->inc_completed_cta();
@@ -5213,6 +5217,26 @@ bool shd_warp_t::hardware_done() const {
 
 bool shd_warp_t::waiting() {
   bool waiting = m_ptx_mbarrier_pending;
+  if (m_ptx_matrix_rendezvous) {
+    if (m_ptx_matrix_rendezvous->arrived != 15)
+      waiting = true;
+    else
+      m_ptx_matrix_rendezvous.reset();
+  }
+  if (m_ptx_matrix_sync) {
+    auto &sync = *m_ptx_matrix_sync;
+    if (!sync.released && sync.arrived == 15 && sync.kind == PTX_WGMMA_WAIT)
+      sync.released = !m_ptx_matrix_group->waiting(sync.argument);
+    if (!sync.released)
+      waiting = true;
+    else {
+      if (DTRACE(PTX_TMA))
+        printf("PTX_GMMA release cycle=%llu warp=%u kind=%u groups=%zu\n",
+               m_shader->get_gpu()->global_cycle(), get_warp_id(), sync.kind,
+               m_ptx_matrix_group->groups.size());
+      m_ptx_matrix_sync.reset();
+    }
+  }
   if (m_ptx_tensor_acquire) {
     const auto &t = *m_ptx_tensor_acquire;
     if (t.kernel->ptx_tensor_publications.count(t.descriptor))
@@ -5417,7 +5441,8 @@ unsigned register_bank(int regnum, int wid, unsigned num_banks,
 bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
   assert(!inst.empty());
 
-  std::list<unsigned> regs = m_shader->get_regs_written(inst);
+  unsigned serviced = 0;
+  bool complete = true;
   for (unsigned op = 0; op < MAX_REG_OPERANDS; op++) {
     int reg_num = inst.arch_reg.dst[op];  // this math needs to match that used
                                           // in function_info::ptx_decode_inst
@@ -5430,12 +5455,13 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
             bank, op_t(&inst, reg_num, m_num_banks, sub_core_model,
                        m_num_banks_per_sched, inst.get_schd_id()));
         inst.arch_reg.dst[op] = -1;
+        ++serviced;
       } else {
-        return false;
+        complete = false;
       }
     }
   }
-  for (unsigned i = 0; i < (unsigned)regs.size(); i++) {
+  for (unsigned i = 0; i < serviced; i++) {
     if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
       unsigned active_count = 0;
       for (unsigned i = 0; i < m_shader->get_config()->warp_size;
@@ -5454,7 +5480,11 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
           m_shader->get_config()->warp_size);  // inst.active_count());
     }
   }
-  return true;
+  if (inst.m_ptx_matrix_op && DTRACE(PTX_TMA))
+    printf("PTX_GMMA ports cycle=%llu uid=%u serviced=%u complete=%u\n",
+           m_shader->get_gpu()->global_cycle(), inst.get_uid(), serviced,
+           unsigned(complete));
+  return complete;
 }
 
 void opndcoll_rfu_t::dispatch_ready_cu() {
@@ -5568,6 +5598,12 @@ void opndcoll_rfu_t::allocate_reads() {
 }
 
 bool opndcoll_rfu_t::collector_unit_t::ready() const {
+  // A later accumulator chain can finish collecting first. Keep each warp's
+  // GMMA order so it cannot occupy the dispatch slot needed by its predecessor.
+  if (!m_free && m_warp->m_ptx_matrix == PTX_WGMMA &&
+      m_warp->m_ptx_matrix_sequence !=
+          m_warp->m_ptx_matrix_group->collector_next[m_warp->m_ptx_matrix_warp])
+    return false;
   return (!m_free) && m_not_ready.none() &&
          (*m_output_register).has_free(m_sub_core_model, m_reg_id);
 }
@@ -5640,6 +5676,8 @@ bool opndcoll_rfu_t::collector_unit_t::allocate(register_set *pipeline_reg_set,
 
 void opndcoll_rfu_t::collector_unit_t::dispatch() {
   assert(m_not_ready.none());
+  if (m_warp->m_ptx_matrix == PTX_WGMMA)
+    ++m_warp->m_ptx_matrix_group->collector_next[m_warp->m_ptx_matrix_warp];
   m_output_register->move_in(m_sub_core_model, m_reg_id, m_warp);
   m_free = true;
   m_output_register = NULL;
@@ -6247,4 +6285,138 @@ void ldst_unit::service_ptx_tensor() {
     }
     it = m_ptx_tensor_events.erase(it);
   }
+}
+
+bool specialized_unit::can_issue(const warp_inst_t &inst) const {
+  return inst.op == m_supported_op && pipelined_simd_unit::can_issue(inst) &&
+         (!inst.m_ptx_matrix_op || m_core->prepare_ptx_matrix(inst));
+}
+
+uint64_t ldst_unit::reserve_ptx_matrix_shared(unsigned bytes) {
+  uint64_t now = m_core->get_gpu()->global_cycle();
+  unsigned service = (bytes + m_config->num_shmem_bank * 4 - 1) /
+                     (m_config->num_shmem_bank * 4);
+  m_ptx_tensor_shared_available =
+      std::max(now, m_ptx_tensor_shared_available) + service;
+  return m_ptx_tensor_shared_available + m_config->smem_latency;
+}
+
+bool shader_core_ctx::prepare_ptx_matrix(const warp_inst_t &inst) {
+  auto &op = *inst.m_ptx_matrix_op;
+  op.collected |= 1 << inst.m_ptx_matrix_warp;
+  if (op.collected != 15) return false;
+  for (const auto &source : op.source)
+    if (source && !source->computed) return false;
+  if (!op.read_ready) {
+    op.read_ready =
+        m_ldst_unit->reserve_ptx_matrix_shared(64 * 16 * 2 + 128 * 16 * 2);
+    if (DTRACE(PTX_TMA))
+      printf("PTX_GMMA read cycle=%llu seq=%u ready=%llu math=262144\n",
+             m_gpu->global_cycle(), inst.m_ptx_matrix_sequence,
+             (unsigned long long)op.read_ready);
+  }
+  if (m_gpu->global_cycle() < op.read_ready) return false;
+  if (!op.computed) op.compute();
+  return true;
+}
+
+void shader_core_ctx::issue_ptx_matrix(warp_inst_t &inst) {
+  unsigned wid = inst.warp_id();
+  auto &warp = *m_warp[wid];
+  auto *thread = m_thread[wid * 32];
+  unsigned t =
+      thread->get_tid().x +
+      thread->get_ntid().x *
+          (thread->get_tid().y + thread->get_ntid().y * thread->get_tid().z);
+  unsigned w = (t / 32) % 4, gid = t / 128;
+  auto &cta = m_ptx_matrix_ctas[warp.get_cta_id()];
+  if (!cta.initial)
+    cta.initial = thread->get_kernel().entry()->get_kernel_info()->regs;
+  auto &group = cta.groups[gid];
+  if (!group) {
+    group = std::make_shared<ptx_matrix_warpgroup>();
+    group->quota = cta.initial;
+  }
+  warp.m_ptx_matrix_group = group;
+  inst.m_ptx_matrix_group = group;
+  inst.m_ptx_matrix_warp = w;
+  unsigned kind = inst.m_ptx_matrix;
+  if (kind == PTX_WGMMA) {
+    unsigned seq = warp.m_ptx_matrix_sequence++;
+    inst.m_ptx_matrix_sequence = seq;
+    auto &op = group->operations[seq];
+    if (!op) {
+      op = std::make_shared<ptx_matrix_op>();
+      group->uncommitted.ops.push_back(op);
+      auto &tuple = inst.m_ptx_matrix_values->dst;
+      for (unsigned j = 0; j < 64; ++j) {
+        auto previous = group->latest.find(tuple[j]);
+        if (previous != group->latest.end()) {
+          op->source[j] = previous->second.first.lock();
+          if (op->source[j] && !op->source[j]->pending) op->source[j].reset();
+          op->source_index[j] = previous->second.second;
+        }
+        group->latest[tuple[j]] = {op, j};
+      }
+    }
+    op->warps[w] = inst.m_ptx_matrix_values;
+    auto &values = *op->warps[w];
+    if (values.scale)
+      for (unsigned l = 0; l < 32; ++l)
+        for (unsigned j = 0; j < 64; ++j)
+          if (!op->source[j])
+            values.initial[l * 64 + j] =
+                values.threads[l]->get_reg(values.dst[j]).f32;
+    op->arrived |= 1 << w;
+    if (DTRACE(PTX_TMA)) {
+      printf(
+          "PTX_GMMA arrive cycle=%llu uid=%u seq=%u warp=%u mask=%u inputs=%u "
+          "outputs=%u\n",
+          m_gpu->global_cycle(), inst.get_uid(), seq, w, op->arrived,
+          inst.incount, inst.outcount);
+      for (unsigned j = 0; j < 64; ++j)
+        printf("PTX_GMMA tuple uid=%u j=%u name=%s reg=%u out=%u dst=%d\n",
+               inst.get_uid(), j, values.dst[j]->name().c_str(),
+               values.dst[j]->reg_num(), inst.out[j], inst.arch_reg.dst[j]);
+    }
+    inst.m_ptx_matrix_op = op;
+    warp.m_ptx_matrix_rendezvous = op;
+    return;
+  }
+  unsigned seq = warp.m_ptx_matrix_control++;
+  auto &sync = group->controls[seq];
+  if (!sync) sync = std::make_shared<ptx_matrix_sync>();
+  sync->kind = kind;
+  sync->argument = inst.m_ptx_matrix_arg;
+  sync->arrived |= 1 << w;
+  warp.m_ptx_matrix_sync = sync;
+  if (sync->arrived != 15) return;
+  if (DTRACE(PTX_TMA))
+    printf(
+        "PTX_GMMA control cycle=%llu cta=%u group=%u kind=%u arg=%u free=%u "
+        "quota=%u initial=%u\n",
+        m_gpu->global_cycle(), warp.get_cta_id(), gid, kind, sync->argument,
+        cta.free, group->quota, cta.initial);
+  if (kind == PTX_WGMMA_COMMIT) {
+    group->groups.push_back(std::move(group->uncommitted));
+    group->uncommitted = ptx_matrix_group();
+  }
+  if (kind == PTX_SETMAX_DEC) {
+    cta.free += 128 * (group->quota - sync->argument);
+    group->quota = sync->argument;
+    cta.allocate();
+  } else if (kind == PTX_SETMAX_INC) {
+    group->quota_request = sync;
+    cta.allocate();
+  }
+  if ((kind == PTX_SETMAX_DEC || kind == PTX_SETMAX_INC) && DTRACE(PTX_TMA))
+    for (auto &item : cta.groups)
+      printf(
+          "PTX_GMMA quota cycle=%llu cta=%u group=%u quota=%u free=%u "
+          "waiting=%u\n",
+          m_gpu->global_cycle(), warp.get_cta_id(), item.first,
+          item.second->quota, cta.free,
+          unsigned(bool(item.second->quota_request)));
+  if (kind != PTX_WGMMA_WAIT && kind != PTX_SETMAX_INC) sync->released = true;
+  group->controls.erase(seq);
 }

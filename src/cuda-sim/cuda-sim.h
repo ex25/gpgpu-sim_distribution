@@ -46,6 +46,7 @@ extern const char *g_gpgpusim_version_string;
 extern int g_debug_execution;
 
 extern void print_splash();
+void matrix_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst);
 void tensor_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst);
 void mbarrier_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst);
 void mbarrier_complete(const warp_inst_t &inst, core_t *core, unsigned latency);
@@ -144,6 +145,8 @@ class cuda_sim {
   char *opcode_latency_fp;
   char *opcode_latency_dp;
   char *opcode_latency_sfu;
+  char *opcode_latency_gmma;
+  char *opcode_initiation_gmma;
   char *opcode_latency_tensor;
   char *opcode_initiation_int;
   char *opcode_initiation_fp;

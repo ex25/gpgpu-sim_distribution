@@ -109,6 +109,10 @@ void cuda_sim::ptx_opcocde_latency_options(option_parser_t opp) {
                          "Opcode initiation intervals for sfu instructions"
                          "Default 8",
                          "8");
+  option_parser_register(opp, "-ptx_opcode_latency_gmma", OPT_CSTR,
+                         &opcode_latency_gmma, "PTX GMMA latency", "64");
+  option_parser_register(opp, "-ptx_opcode_initiation_gmma", OPT_CSTR,
+                         &opcode_initiation_gmma, "PTX GMMA initiation", "64");
   option_parser_register(opp, "-ptx_opcode_initiation_tensor", OPT_CSTR,
                          &opcode_initiation_tensor,
                          "Opcode initiation intervals for tensor instructions"
@@ -759,6 +763,7 @@ void ptx_instruction::set_opcode_and_latency() {
   unsigned dp_latency[5];
   unsigned sfu_latency;
   unsigned tensor_latency;
+  unsigned gmma_latency, gmma_init;
   unsigned int_init[6];
   unsigned fp_init[5];
   unsigned dp_init[5];
@@ -782,6 +787,8 @@ void ptx_instruction::set_opcode_and_latency() {
          &dp_latency[0], &dp_latency[1], &dp_latency[2], &dp_latency[3],
          &dp_latency[4]);
   sscanf(gpgpu_ctx->func_sim->opcode_latency_sfu, "%u", &sfu_latency);
+  sscanf(gpgpu_ctx->func_sim->opcode_latency_gmma, "%u", &gmma_latency);
+  sscanf(gpgpu_ctx->func_sim->opcode_initiation_gmma, "%u", &gmma_init);
   sscanf(gpgpu_ctx->func_sim->opcode_latency_tensor, "%u", &tensor_latency);
   sscanf(gpgpu_ctx->func_sim->opcode_initiation_int, "%u,%u,%u,%u,%u,%u",
          &int_init[0], &int_init[1], &int_init[2], &int_init[3], &int_init[4],
@@ -1150,6 +1157,15 @@ void ptx_instruction::set_opcode_and_latency() {
       initiation_interval = sfu_init;
       op = SFU_OP;
       break;
+    case WGMMA_OP:
+      op = SPECIALIZED_UNIT_5_OP;
+      latency = gmma_latency;
+      initiation_interval = gmma_init;
+      break;
+    case LDMATRIX_OP:
+    case STMATRIX_OP:
+      op = m_opcode == LDMATRIX_OP ? LOAD_OP : STORE_OP;
+      break;
     case MMA_OP:
       latency = tensor_latency;
       initiation_interval = tensor_init;
@@ -1241,7 +1257,11 @@ void ptx_instruction::pre_decode() {
   space = m_space_spec;
   memory_op = no_memory_op;
   data_size = 0;
-  if (has_memory_read() || has_memory_write()) {
+  if (m_opcode == LDMATRIX_OP || m_opcode == STMATRIX_OP) {
+    space = shared_space;
+    data_size = 16;
+    memory_op = m_opcode == LDMATRIX_OP ? memory_load : memory_store;
+  } else if (has_memory_read() || has_memory_write()) {
     unsigned to_type = get_type();
     data_size = datatype2size(to_type);
     memory_op = has_memory_read() ? memory_load : memory_store;
@@ -1312,6 +1332,7 @@ void ptx_instruction::pre_decode() {
       break;
   }
 
+  if (is_matrix_ptx()) m_ptx_matrix = m_opcode - LDMATRIX_OP + 1;
   set_opcode_and_latency();
   set_bar_type();
   // Get register operands
@@ -1336,7 +1357,8 @@ void ptx_instruction::pre_decode() {
         }
       }
     } else {
-      if ((m_opcode == CP_ASYNC_OP || m_ptx_mbarrier || is_tensor_ptx()) &&
+      if ((m_opcode == CP_ASYNC_OP || m_ptx_mbarrier || is_tensor_ptx() ||
+           is_matrix_ptx()) &&
           o.is_memory_operand()) {
         if (o.get_symbol()->type()->get_key().is_reg()) {
           in[m] = o.reg_num();
@@ -1352,17 +1374,21 @@ void ptx_instruction::pre_decode() {
         // now
         is_vectorout = 1;
         unsigned num_elem = o.get_vect_nelem();
-        if (num_elem >= 1) in[m + 0] = o.reg1_num();
-        if (num_elem >= 2) in[m + 1] = o.reg2_num();
-        if (num_elem >= 3) in[m + 2] = o.reg3_num();
-        if (num_elem >= 4) in[m + 3] = o.reg4_num();
-        if (num_elem >= 5) in[m + 4] = o.reg5_num();
-        if (num_elem >= 6) in[m + 5] = o.reg6_num();
-        if (num_elem >= 7) in[m + 6] = o.reg7_num();
-        if (num_elem >= 8) in[m + 7] = o.reg8_num();
-        for (int i = 0; i < num_elem; i++)
+        for (unsigned i = 0; i < num_elem; ++i) {
+          in[m + i] = o.vec_symbol(i)->reg_num();
           arch_reg.src[m + i] = o.arch_reg_num(i);
+        }
         m += num_elem;
+      }
+    }
+  }
+
+  if (m_opcode == WGMMA_OP) {
+    const auto &scale = operand_lookup(3);
+    if (!scale.is_literal() || scale.get_literal_value().u64) {
+      for (unsigned i = 0; i < 64; ++i) {
+        in[m] = out[i];
+        arch_reg.src[m++] = arch_reg.dst[i];
       }
     }
   }
@@ -1384,7 +1410,8 @@ void ptx_instruction::pre_decode() {
   // Get address registers inside memory operands.
   // Assuming only one memory operand per instruction,
   //  and maximum of two address registers for one memory operand.
-  if (m_opcode != CP_ASYNC_OP && (has_memory_read() || has_memory_write())) {
+  if (m_opcode != CP_ASYNC_OP && !is_matrix_ptx() &&
+      (has_memory_read() || has_memory_write())) {
     ptx_instruction::const_iterator op = op_iter_begin();
     for (; op != op_iter_end(); op++, n++) {  // process operands
       const operand_info &o = *op;
@@ -2005,7 +2032,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // to be executed only once. To make the simulation faster removing the
       // redundant tensorcore operation
       if (!pI->m_ptx_mbarrier && !pI->is_tensor_ptx() && !pI->is_cp_async() &&
-          !pI->is_warp_collective() &&
+          !pI->is_warp_collective() && !pI->is_matrix_ptx() &&
           (!tensorcore_op(inst_opcode) || lane_id == 0)) {
         switch (inst_opcode) {
 #define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
@@ -2066,7 +2093,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     memory_space_t insn_space = undefined_space;
     _memory_op_t insn_memory_op = no_memory_op;
     unsigned insn_data_size = 0;
-    if (!pI->is_tensor_ptx() && !pI->is_cp_async() &&
+    if (!pI->is_tensor_ptx() && !pI->is_cp_async() && !pI->is_matrix_ptx() &&
         (pI->has_memory_read() || pI->has_memory_write())) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         insn_memaddr = last_eaddr();
@@ -2179,7 +2206,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
 
     // "Return values"
     if (!skip && !pI->m_ptx_mbarrier && !pI->is_tensor_ptx() &&
-        !pI->is_cp_async()) {
+        !pI->is_cp_async() && !pI->is_matrix_ptx()) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);

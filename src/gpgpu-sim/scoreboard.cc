@@ -37,6 +37,7 @@ Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu)
   m_sid = sid;
   // Initialize size of table
   reg_table.resize(n_warps);
+  matrix_writers.resize(n_warps);
   longopregs.resize(n_warps);
 
   m_gpu = gpu;
@@ -82,7 +83,11 @@ const bool Scoreboard::islongop(unsigned warp_id, unsigned regnum) {
 void Scoreboard::reserveRegisters(const class warp_inst_t* inst) {
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst->out[r] > 0) {
-      reserveRegister(inst->warp_id(), inst->out[r]);
+      if (inst->m_ptx_matrix == PTX_WGMMA) {
+        if (matrix_writers[inst->warp_id()][inst->out[r]]++ == 0)
+          reserveRegister(inst->warp_id(), inst->out[r]);
+      } else
+        reserveRegister(inst->warp_id(), inst->out[r]);
       SHADER_DPRINTF(SCOREBOARD, "Reserved register - warp:%d, reg: %d\n",
                      inst->warp_id(), inst->out[r]);
     }
@@ -111,6 +116,11 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
     if (inst->out[r] > 0) {
       SHADER_DPRINTF(SCOREBOARD, "Register Released - warp:%d, reg: %d\n",
                      inst->warp_id(), inst->out[r]);
+      if (inst->m_ptx_matrix == PTX_WGMMA &&
+          --matrix_writers[inst->warp_id()].at(inst->out[r]))
+        continue;
+      if (inst->m_ptx_matrix == PTX_WGMMA)
+        matrix_writers[inst->warp_id()].erase(inst->out[r]);
       releaseRegister(inst->warp_id(), inst->out[r]);
       longopregs[inst->warp_id()].erase(inst->out[r]);
     }
@@ -125,6 +135,10 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
  * true if WAW or RAW hazard (no WAR since in-order issue)
  **/
 bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
+  if (inst->m_ptx_matrix == PTX_WGMMA_FENCE) {
+    for (unsigned reg : reg_table[wid])
+      if (!matrix_writers[wid].count(reg)) return true;
+  }
   // Get list of all input and output registers
   std::unordered_set<int> inst_regs;
 
@@ -143,7 +157,12 @@ bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
   std::unordered_set<int>::const_iterator it2;
   for (it2 = inst_regs.begin(); it2 != inst_regs.end(); it2++)
     if (reg_table[wid].find(*it2) != reg_table[wid].end()) {
-      return true;
+      bool ordered = false;
+      if (inst->m_ptx_matrix == PTX_WGMMA && matrix_writers[wid].count(*it2)) {
+        for (unsigned j = 0; j < inst->outcount; ++j)
+          ordered |= inst->out[j] == unsigned(*it2);
+      }
+      if (!ordered) return true;
     }
   return false;
 }

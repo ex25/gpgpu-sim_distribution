@@ -46,6 +46,7 @@
 #include <memory>
 #include <unordered_set>
 #include <vector>
+#include "cuda-sim/ptx_matrix.h"
 #include "cuda-sim/tensor_map.h"
 #include "statistics.h"
 #include "utils.h"
@@ -65,8 +66,8 @@ class gpgpu_context;
 #define MAX_BARRIERS_PER_CTA 16
 
 // After expanding the vector input and output operands
-#define MAX_INPUT_VALUES 24
-#define MAX_OUTPUT_VALUES 8
+#define MAX_INPUT_VALUES 68
+#define MAX_OUTPUT_VALUES 64
 
 const unsigned MAX_WARP_SIZE = 32;
 
@@ -1372,7 +1373,7 @@ class mem_fetch_allocator {
 
 // the maximum number of destination, source, or address uarch operands in a
 // instruction
-#define MAX_REG_OPERANDS 32
+#define MAX_REG_OPERANDS 68
 
 struct dram_callback_t {
   dram_callback_t() {
@@ -1404,8 +1405,8 @@ class inst_t {
     const_cache_operand = 0;
     num_operands = 0;
     num_regs = 0;
-    memset(out, 0, sizeof(unsigned));
-    memset(in, 0, sizeof(unsigned));
+    memset(out, 0, sizeof(out));
+    memset(in, 0, sizeof(in));
     is_vectorin = 0;
     is_vectorout = 0;
     space = memory_space_t();
@@ -1522,9 +1523,9 @@ class inst_t {
   address_type reconvergence_pc;  // -1 => not a branch, -2 => use function
                                   // return address
 
-  unsigned out[8];
+  unsigned out[MAX_OUTPUT_VALUES];
   unsigned outcount;
-  unsigned in[24];
+  unsigned in[MAX_INPUT_VALUES];
   unsigned incount;
   unsigned char is_vectorin;
   unsigned char is_vectorout;
@@ -1537,6 +1538,7 @@ class inst_t {
   } arch_reg;
   // int arch_reg[MAX_REG_OPERANDS]; // register number for bank conflict
   // evaluation
+  unsigned m_ptx_matrix = 0;
   ptx_tensor_kind m_ptx_tensor_op = PTX_TENSOR_NONE;
   unsigned latency;  // operation latency
   unsigned initiation_interval;
@@ -1678,7 +1680,12 @@ class warp_inst_t : public inst_t {
   void broadcast_barrier_reduction(const active_mask_t &access_mask);
   void do_atomic(bool forceDo = false);
   void do_atomic(const active_mask_t &access_mask, bool forceDo = false);
-  void clear() { m_empty = true; }
+  void clear() {
+    m_empty = true;
+    m_ptx_matrix_values.reset();
+    m_ptx_matrix_op.reset();
+    m_ptx_matrix_group.reset();
+  }
 
   void issue(const active_mask_t &mask, unsigned warp_id,
              unsigned long long cycle, int dynamic_warp_id, int sch_id,
@@ -1916,6 +1923,11 @@ class warp_inst_t : public inst_t {
   // Ni: add boolean to indicate whether the instruction is ldgsts
   bool m_is_ldgsts;
   // PTX copy/commit/wait are separate from trace DEPBAR classification.
+  unsigned m_ptx_matrix_arg = 0;
+  unsigned m_ptx_matrix_warp = 0, m_ptx_matrix_sequence = 0;
+  std::shared_ptr<ptx_matrix_warp> m_ptx_matrix_values;
+  std::shared_ptr<ptx_matrix_op> m_ptx_matrix_op;
+  std::shared_ptr<ptx_matrix_warpgroup> m_ptx_matrix_group;
   std::shared_ptr<ptx_tensor_transfer> m_ptx_tensor;
   bool m_ptx_mbarrier = false;
   unsigned m_ptx_cluster_barrier = 0;  // 1 = arrive, 2 = wait

@@ -19,11 +19,15 @@ struct ptx_tensor_map {
   }
 };
 
+// XOR permutation of 16B blocks; the caller supplies its canonical origin.
+inline unsigned ptx_shared_swizzle(unsigned address, unsigned mask) {
+  return address ^ (((address >> 7) & mask) << 4);
+}
 inline unsigned ptx_tensor_shared_address(unsigned base, unsigned offset,
                                           unsigned swizzle) {
   unsigned address = base + offset;
   unsigned mask = swizzle == 2 ? 3 : 7;  // CUDA 64B / 128B enums
-  return address ^ (((address >> 7) & mask) << 4);
+  return ptx_shared_swizzle(address, mask);
 }
 
 enum ptx_tensor_kind {

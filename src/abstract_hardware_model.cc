@@ -347,18 +347,24 @@ void warp_inst_t::generate_mem_accesses() {
              thread < (subwarp + 1) * subwarp_size; thread++) {
           if (!active(thread)) continue;
           assert(!m_per_scalar_thread[thread].memreqaddr.empty());
-          new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
-          // For STAS, the address is combined: upper 32 bits = mbarrier,
-          // lower 32 bits = store address
-          if (op == STAS_OP) {
-            addr = addr & 0xFFFFFFFF;
+          unsigned requests =
+              m_ptx_matrix == PTX_LDMATRIX || m_ptx_matrix == PTX_STMATRIX ? 4
+                                                                           : 1;
+          for (unsigned q = 0; q < requests; ++q) {
+            new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[q];
+            // For STAS, the address is combined: upper 32 bits = mbarrier,
+            // lower 32 bits = store address
+            if (op == STAS_OP) {
+              addr = addr & 0xFFFFFFFF;
+            }
+            // FIXME: deferred allocation of shared memory should not accumulate
+            // across kernel launches assert( addr < m_config->gpgpu_shmem_size
+            // );
+            unsigned bank = m_config->shmem_bank_func(addr);
+            new_addr_type word =
+                line_size_based_tag_func(addr, m_config->WORD_SIZE);
+            bank_accs[bank][word]++;
           }
-          // FIXME: deferred allocation of shared memory should not accumulate
-          // across kernel launches assert( addr < m_config->gpgpu_shmem_size );
-          unsigned bank = m_config->shmem_bank_func(addr);
-          new_addr_type word =
-              line_size_based_tag_func(addr, m_config->WORD_SIZE);
-          bank_accs[bank][word]++;
         }
 
         if (m_config->shmem_limited_broadcast) {
@@ -1321,6 +1327,7 @@ void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
   if (pI->is_cp_async() && inst.active_count()) cp_async_impl(pI, this, inst);
   if (pI->m_ptx_mbarrier && inst.active_count()) mbarrier_impl(pI, this, inst);
   if (pI->is_tensor_ptx() && inst.active_count()) tensor_impl(pI, this, inst);
+  if (pI->is_matrix_ptx() && inst.active_count()) matrix_impl(pI, this, inst);
 }
 
 bool core_t::ptx_thread_done(unsigned hw_thread_id) const {
