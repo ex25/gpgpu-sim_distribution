@@ -716,6 +716,7 @@ class gpgpu_sim : public gpgpu_t {
   void reinit_clock_domains(void);
   int next_clock_domain(void);
   void issue_block2core();
+  unsigned issue_ptx_cluster(kernel_info_t &kernel);
   void print_dram_stats(FILE *fout) const;
   void shader_print_runtime_stat(FILE *fout);
   void shader_print_l1_miss_stat(FILE *fout) const;

@@ -3318,16 +3318,19 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   switch (space.get_type()) {
     case shared_space:
       t = isspace_shared(smid, addr);
+      break;
     case local_space:
       t = isspace_local(smid, hwtid, addr);
+      break;
     case global_space:
       t = isspace_global(addr);
+      break;
     default:
       abort();
   }
 
   ptx_reg_t p;
-  p.pred = t ? 1 : 0;
+  p.pred = t ? 0 : 1;
 
   thread->set_reg(dst.get_symbol(), p);
 }
@@ -3427,7 +3430,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = src1_data.u32;
+  addr_t addr = src1_data.u64;
 
   decode_space(space, thread, src1, mem, addr);
 
@@ -3500,7 +3503,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = addr_reg.u32;
+    addr_t addr = addr_reg.u64;
 
     new_addr_type mem_txn_addr[MAX_ACCESSES_PER_INSN_PER_THREAD];
     int num_mem_txn = 0;
@@ -3620,7 +3623,7 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = src1_data.u32;
+    addr_t addr = src1_data.u64;
     smid = thread->get_hw_sid();
     if (whichspace(addr) == shared_space) {
       addr = generic_to_shared(smid, addr);
@@ -5896,7 +5899,7 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = addr_reg.u32;
+  addr_t addr = addr_reg.u64;
 
   decode_space(space, thread, dst, mem, addr);
 
@@ -6709,4 +6712,21 @@ void cp_async_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   }
   inst.space = global_space;
   inst.data_size = 16;
+}
+
+void mapa_impl(const ptx_instruction *p, ptx_thread_info *thread) {
+  const auto &dst = p->dst();
+  unsigned offset =
+      thread->get_operand_value(p->src1(), dst, U32_TYPE, thread, 1).u32;
+  unsigned rank =
+      thread->get_operand_value(p->src2(), dst, U32_TYPE, thread, 1).u32;
+  ptx_reg_t result;
+  result.u32 = (rank << 24) | (offset & 0xffffff);
+  thread->set_operand_value(dst, result, U32_TYPE, thread, p);
+}
+
+void cluster_bar_impl(const ptx_instruction *p, core_t *core, warp_inst_t w) {
+  // Arrival, communication and waiting are handled once per issued warp in
+  // shader_core_ctx::issue_warp, after per-lane predicate evaluation.
+  assert(!core->get_gpu()->is_functional_sim());
 }

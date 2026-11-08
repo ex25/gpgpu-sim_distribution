@@ -1070,6 +1070,23 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
 
+  if ((*pipe_reg)->m_ptx_cluster_barrier && (*pipe_reg)->active_count()) {
+    auto &warp = *m_warp[warp_id];
+    ptx_thread_info *thread = m_thread[warp_id * m_config->warp_size];
+    kernel_info_t &kernel = thread->get_kernel();
+    dim3 id = kernel.cluster_id(thread->get_ctaid());
+    unsigned count = (*pipe_reg)->active_count();
+    if ((*pipe_reg)->m_ptx_cluster_barrier == 1) {
+      kernel.cluster_arrive(id, warp.m_ptx_cluster_epoch, count,
+                            m_gpu->global_cycle(), m_config->smem_latency);
+    } else {
+      warp.m_ptx_cluster_kernel = &kernel;
+      warp.m_ptx_cluster_id = id;
+      warp.m_ptx_cluster_wait_count = count;
+      warp.m_ptx_cluster_waiting = true;
+    }
+  }
+
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
   warp_inst_t &issued = **pipe_reg;
@@ -3934,6 +3951,8 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
 
     // Jin: for concurrent kernels on sm
     release_shader_resource_1block(cta_num, *kernel);
+    if (kernel->is_ptx_cluster())
+      kernel->retire_cluster_cta(m_ptx_cta_ids[cta_num]);
     kernel->dec_running();
     if (!m_gpu->kernel_more_cta_left(kernel)) {
       if (!kernel->running()) {
@@ -5056,6 +5075,17 @@ bool shd_warp_t::hardware_done() const {
 
 bool shd_warp_t::waiting() {
   bool waiting = false;
+  if (m_ptx_cluster_waiting) {
+    auto *kernel = m_ptx_cluster_kernel;
+    if (kernel->cluster_wait_ready(m_ptx_cluster_id, m_ptx_cluster_epoch)) {
+      kernel->cluster_wait_release(m_ptx_cluster_id, m_ptx_cluster_epoch,
+                                   m_ptx_cluster_wait_count);
+      ++m_ptx_cluster_epoch;
+      m_ptx_cluster_waiting = false;
+    } else {
+      waiting = true;
+    }
+  }
   // waiting to be initialized with a kernel
   waiting |= functional_done();
   // waiting for other warps in CTA to reach barrier
@@ -5580,7 +5610,11 @@ unsigned simt_core_cluster::issue_block2core() {
       }
     }
 
-    if (m_gpu->kernel_more_cta_left(kernel) &&
+    if (m_gpu->kernel_more_cta_left(kernel) && kernel->is_ptx_cluster())
+      return 0;  // CUDA clusters are admitted together by gpgpu_sim.
+
+    if (m_core[core]->m_last_cta_issue_cycle != m_gpu->global_cycle() &&
+        m_gpu->kernel_more_cta_left(kernel) &&
         //            (m_core[core]->get_n_active_cta() <
         //            m_config->max_cta(*kernel)) ) {
         m_core[core]->can_issue_1block(*kernel)) {

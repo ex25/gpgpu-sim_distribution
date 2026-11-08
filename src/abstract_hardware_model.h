@@ -56,6 +56,7 @@
 // Forward declarations
 class gpgpu_sim;
 class kernel_info_t;
+class memory_space;
 class gpgpu_context;
 
 // Set a hard limit of 32 CTAs per shader [cuda only has 8]
@@ -550,6 +551,44 @@ class kernel_info_t {
   void set_dynamic_shared_memory(size_t bytes) { m_dynamic_shared_memory = bytes; }
   size_t dynamic_shared_memory() const { return m_dynamic_shared_memory; }
   size_t shared_memory_per_cta() const;
+  void set_driver_shared_memory(size_t bytes) {
+    m_driver_shared_memory = bytes;
+  }
+  size_t driver_shared_memory() const { return m_driver_shared_memory; }
+
+  void set_cluster_dim(dim3 dims) { m_cluster_dim = dims; }
+  dim3 cluster_dim() const { return m_cluster_dim; }
+  bool is_ptx_cluster() const { return m_cluster_dim.y == 2; }
+  dim3 cluster_id(dim3 cta) const {
+    return dim3(cta.x / m_cluster_dim.x, cta.y / m_cluster_dim.y,
+                cta.z / m_cluster_dim.z);
+  }
+  dim3 cluster_ctaid(dim3 cta) const {
+    return dim3(cta.x % m_cluster_dim.x, cta.y % m_cluster_dim.y,
+                cta.z % m_cluster_dim.z);
+  }
+  unsigned cluster_rank(dim3 cta) const {
+    dim3 local = cluster_ctaid(cta);
+    return local.x + m_cluster_dim.x * (local.y + m_cluster_dim.y * local.z);
+  }
+
+  // PTX cluster addresses encode rank in bits 31:24, not an SM or generic VA.
+  struct ptx_shared_target {
+    memory_space *shared;
+    dim3 cta;
+    unsigned offset;
+  };
+  memory_space *create_cluster_shared(dim3 cta);
+  ptx_shared_target resolve_cluster_shared(dim3 source_cta, uint32_t address);
+  ptx_shared_target resolve_local_shared(dim3 cta, unsigned offset) {
+    return resolve_cluster_shared(cta, (cluster_rank(cta) << 24) | offset);
+  }
+  void retire_cluster_cta(dim3 cta);
+  void cluster_arrive(dim3 id, uint64_t epoch, unsigned count, uint64_t cycle,
+                      unsigned latency);
+  void service_cluster_arrivals(uint64_t cycle);
+  bool cluster_wait_ready(dim3 id, uint64_t epoch) const;
+  void cluster_wait_release(dim3 id, uint64_t epoch, unsigned count);
 
   size_t num_blocks() const {
     return m_grid_dim.x * m_grid_dim.y * m_grid_dim.z;
@@ -563,7 +602,24 @@ class kernel_info_t {
   dim3 get_cta_dim() const { return m_block_dim; }
 
   void increment_cta_id() {
-    increment_x_then_y_then_z(m_next_cta, m_grid_dim);
+    if (is_ptx_cluster()) {
+      // Enumerate both members before moving to the next cluster.
+      if (m_next_cta.y % 2 == 0) {
+        ++m_next_cta.y;
+      } else {
+        --m_next_cta.y;
+        if (++m_next_cta.x == m_grid_dim.x) {
+          m_next_cta.x = 0;
+          m_next_cta.y += 2;
+          if (m_next_cta.y == m_grid_dim.y) {
+            m_next_cta.y = 0;
+            ++m_next_cta.z;
+          }
+        }
+      }
+    } else {
+      increment_x_then_y_then_z(m_next_cta, m_grid_dim);
+    }
     m_next_tid.x = 0;
     m_next_tid.y = 0;
     m_next_tid.z = 0;
@@ -635,6 +691,26 @@ class kernel_info_t {
   dim3 m_next_cta;
   dim3 m_next_tid;
 
+  dim3 m_cluster_dim = dim3(1, 1, 1);
+  // A member may retire while its peer still needs its shared object.
+  struct ptx_cluster_state {
+    std::unique_ptr<memory_space> shared[2];
+    dim3 cta[2];
+    unsigned retired = 0;
+    struct round {
+      unsigned arrived = 0;
+      unsigned released = 0;
+    };
+    std::map<uint64_t, round> rounds;
+    struct arrival {
+      uint64_t cycle, epoch;
+      unsigned count;
+    };
+    std::deque<arrival> arrivals;
+    uint64_t last_delivery = 0;
+  };
+  std::map<dim3, ptx_cluster_state, utils::Dim3Compare> m_ptx_clusters;
+  size_t m_driver_shared_memory = 0;
   size_t m_dynamic_shared_memory = 0;
   unsigned m_num_cores_running;
 
@@ -796,13 +872,13 @@ class simt_stack {
 // Let's just upgrade to C++11 so we can use constexpr here...
 // start allocating from this address (lower values used for allocating globals
 // in .ptx file)
-const unsigned long long GLOBAL_HEAP_START = 0xC0000000;
-// Volta max shmem size is 96kB
-const unsigned long long SHARED_MEM_SIZE_MAX = 96 * (1 << 10);
+const unsigned long long GLOBAL_HEAP_START = 0x200000000ULL;
+// Address slots cover H100 capacity; resource limits still come from config.
+const unsigned long long SHARED_MEM_SIZE_MAX = 256 * (1 << 10);
 // Volta max local mem is 16kB
 const unsigned long long LOCAL_MEM_SIZE_MAX = 1 << 14;
-// Volta Titan V has 80 SMs
-const unsigned MAX_STREAMING_MULTIPROCESSORS = 80;
+// H100 has 132 SMs.
+const unsigned MAX_STREAMING_MULTIPROCESSORS = 132;
 // Max 2048 threads / SM
 const unsigned MAX_THREAD_PER_SM = 1 << 11;
 // MAX 64 warps / SM
@@ -1005,6 +1081,7 @@ struct gpgpu_ptx_sim_info {
   // These will be set to zero if a ptxinfo file is not present.
   int lmem;
   int smem;
+  unsigned smem_system = 0;
   int cmem;
   int gmem;
   int regs;
@@ -1785,6 +1862,7 @@ class warp_inst_t : public inst_t {
   // Ni: add boolean to indicate whether the instruction is ldgsts
   bool m_is_ldgsts;
   // PTX copy/commit/wait are separate from trace DEPBAR classification.
+  unsigned m_ptx_cluster_barrier = 0;  // 1 = arrive, 2 = wait
   ptx_cp_async_kind m_ptx_cp_async_op = PTX_CP_ASYNC_NONE;
   unsigned m_ptx_cp_async_wait = 0;
   std::shared_ptr<std::vector<ptx_cp_async_copy>> m_ptx_cp_async_copies;

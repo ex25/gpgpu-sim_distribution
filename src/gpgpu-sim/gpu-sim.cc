@@ -2067,6 +2067,7 @@ unsigned exec_shader_core_ctx::sim_init_thread(
 }
 
 void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
+  m_last_cta_issue_cycle = m_gpu->global_cycle();
   if (!m_config->gpgpu_concurrent_kernel_sm)
     set_max_cta(kernel);
   else
@@ -2089,6 +2090,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
     }
   }
   assert(free_cta_hw_id != (unsigned)-1);
+  m_ptx_cta_ids[free_cta_hw_id] = kernel.get_next_cta_id();
 
   // determine hardware threads and warps that will be used for this CTA
   int cta_size = kernel.threads_per_cta();
@@ -2216,7 +2218,46 @@ int gpgpu_sim::next_clock_domain(void) {
   return mask;
 }
 
+unsigned gpgpu_sim::issue_ptx_cluster(kernel_info_t &kernel) {
+  shader_core_ctx *selected[2];
+  unsigned count = 0;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters && count < 2; ++i) {
+    for (unsigned j = 0; j < m_cluster[i]->get_n_shader_cores() && count < 2;
+         ++j) {
+      auto *core = m_cluster[i]->get_shader_cores()[j];
+      if (core->m_last_cta_issue_cycle == global_cycle()) continue;
+      if (!m_shader_config->gpgpu_concurrent_kernel_sm &&
+          core->get_not_completed() && core->get_kernel() != &kernel)
+        continue;
+      if (core->can_issue_1block(kernel)) selected[count++] = core;
+    }
+  }
+  if (count != 2) return 0;
+  for (auto *core : selected) {
+    if (!m_shader_config->gpgpu_concurrent_kernel_sm &&
+        core->get_kernel() != &kernel)
+      core->set_kernel(&kernel);
+    core->issue_block2core(kernel);
+  }
+  return 2;
+}
+
 void gpgpu_sim::issue_block2core() {
+  bool cluster_pending = false;
+  for (auto *kernel : m_running_kernels)
+    if (kernel && kernel->is_ptx_cluster() && kernel_more_cta_left(kernel) &&
+        !kernel->m_kernel_TB_latency)
+      cluster_pending = true;
+  if (cluster_pending) {
+    kernel_info_t *kernel = select_kernel();
+    if (kernel && kernel->is_ptx_cluster()) {
+      while (kernel_more_cta_left(kernel)) {
+        unsigned issued = issue_ptx_cluster(*kernel);
+        if (!issued) break;
+        m_total_cta_launched += issued;
+      }
+    }
+  }
   unsigned last_issued = m_last_cluster_issue;
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
     unsigned idx = (i + last_issued + 1) % m_shader_config->n_simt_clusters;
@@ -2356,6 +2397,9 @@ void gpgpu_sim::cycle() {
   }
 
   if (clock_mask & CORE) {
+    for (auto *kernel : m_running_kernels)
+      if (kernel && kernel->is_ptx_cluster())
+        kernel->service_cluster_arrivals(global_cycle());
     // L1 cache + shader core pipeline stages
     m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {

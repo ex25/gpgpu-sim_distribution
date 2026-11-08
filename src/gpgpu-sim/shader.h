@@ -149,6 +149,9 @@ class shd_warp_t {
     // Ni: Set waiting to false
     m_waiting_ldgsts = false;
     for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
+    m_ptx_cluster_epoch = 0;
+    m_ptx_cluster_waiting = false;
+    m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
     for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
@@ -202,6 +205,9 @@ class shd_warp_t {
     // Ni: Set waiting to false
     m_waiting_ldgsts = false;
     for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
+    m_ptx_cluster_epoch = 0;
+    m_ptx_cluster_waiting = false;
+    m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
     for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
@@ -519,6 +525,12 @@ class shd_warp_t {
   // either: cp.async.bulk.wait_group N or cp.async.wait_group
   unsigned int m_depbar_group;
   cp_async_groups m_ptx_cp_async_groups[MAX_WARP_SIZE];
+  kernel_info_t *m_ptx_cluster_kernel = nullptr;
+  uint64_t m_ptx_cluster_epoch = 0;
+  bool m_ptx_cluster_waiting = false;
+  unsigned m_ptx_cluster_wait_count = 0;
+  dim3 m_ptx_cluster_id;
+
   bool m_waiting_ldgsts;  // Ni: Whether the warp is waiting for the LDGSTS
                           // instrs to finish
 
@@ -3199,6 +3211,7 @@ class shader_core_ctx : public core_t {
   // CTA scheduling / hardware thread allocation
   unsigned m_n_active_cta;  // number of Cooperative Thread Arrays (blocks)
                             // currently running on this shader.
+  dim3 m_ptx_cta_ids[MAX_CTA_PER_SHADER];
   unsigned m_cta_status[MAX_CTA_PER_SHADER];  // CTAs status
   unsigned m_not_completed;  // number of threads to be completed (==0 when all
                              // thread on this core completed)
@@ -3253,6 +3266,7 @@ class shader_core_ctx : public core_t {
 
   // Jin: concurrent kernels on a sm
  public:
+  uint64_t m_last_cta_issue_cycle = uint64_t(-1);
   bool can_issue_1block(kernel_info_t &kernel);
   bool occupy_shader_resource_1block(kernel_info_t &kernel, bool occupy);
   void release_shader_resource_1block(unsigned hw_ctaid, kernel_info_t &kernel);

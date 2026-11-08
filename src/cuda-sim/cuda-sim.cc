@@ -579,8 +579,11 @@ void ptx_instruction::set_fp_or_int_archop() {
   if ((m_opcode == MEMBAR_OP) || (m_opcode == SSY_OP) || (m_opcode == BRA_OP) ||
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
-      (m_opcode == CALL_OP) || (m_opcode == TRAP_OP)) {
+      (m_opcode == CALL_OP) || (m_opcode == TRAP_OP) ||
+      m_opcode == CLUSTER_ARRIVE_OP || m_opcode == CLUSTER_WAIT_OP) {
     // do nothing
+  } else if (m_opcode == ISSPACEP_OP) {
+    oprnd_type = INT_OP;
   } else if ((m_opcode == CVT_OP || m_opcode == SET_OP ||
               m_opcode == SLCT_OP)) {
     if (get_type2() == F16_TYPE || get_type2() == F32_TYPE ||
@@ -600,6 +603,9 @@ void ptx_instruction::set_fp_or_int_archop() {
 
 void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
+  if (m_opcode == ISSPACEP_OP || m_opcode == CLUSTER_ARRIVE_OP ||
+      m_opcode == CLUSTER_WAIT_OP)
+    return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
       (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
@@ -807,6 +813,12 @@ void ptx_instruction::set_opcode_and_latency() {
       assert(!(has_memory_read() && has_memory_write()));
       if (has_memory_read()) op = LOAD_OP;
       if (has_memory_write()) op = STORE_OP;
+      break;
+    case CLUSTER_ARRIVE_OP:
+      m_ptx_cluster_barrier = 1;
+      break;
+    case CLUSTER_WAIT_OP:
+      m_ptx_cluster_barrier = 2;
       break;
     case CP_ASYNC_OP:
       m_ptx_cp_async_op = PTX_CP_ASYNC_COPY;
@@ -2174,6 +2186,9 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     cta_info->check_cta_thread_status_and_reset();
   }
 
+  if (kernel.is_ptx_cluster())
+    shared_mem = kernel.create_cluster_shared(kernel.get_next_cta_id());
+
   std::map<unsigned, memory_space *> &local_mem_lookup =
       local_memory_lookup[sid];
   while (kernel.more_threads_in_cta()) {
@@ -2833,6 +2848,7 @@ void ptxinfo_gmem(unsigned declared, unsigned system) {
 
 void ptxinfo_smem(unsigned declared, unsigned system) {
   g_ptxinfo.smem = declared + system;
+  g_ptxinfo.smem_system = system;
 }
 
 void ptxinfo_cmem(unsigned nbytes, unsigned bank) { g_ptxinfo.cmem += nbytes; }
@@ -2843,6 +2859,7 @@ void clear_ptxinfo() {
   g_ptxinfo.regs = 0;
   g_ptxinfo.lmem = 0;
   g_ptxinfo.smem = 0;
+  g_ptxinfo.smem_system = 0;
   g_ptxinfo.cmem = 0;
   g_ptxinfo.gmem = 0;
   g_ptxinfo.ptx_version = 0;

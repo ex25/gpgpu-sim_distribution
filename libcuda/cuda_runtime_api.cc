@@ -1010,14 +1010,21 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
   function_info *entry = context->get_kernel(hostFun);
   size_t shared = config.shared_mem();
   gpgpu_sim *gpu_model = context->get_device()->get_gpgpu();
-  size_t base = ptx_sim_kernel_info(entry)->smem;
+  const auto *resources = ptx_sim_kernel_info(entry);
+  size_t base = resources->smem;
+  // H100 reserves 1 KiB per CTA (ncu launch__shared_mem_per_block_driver).
+  // ptxas system shared, when present, is already included in smem.
+  size_t driver_shared = resources->sm_target == 90
+                             ? 1024 - std::min(1024u, resources->smem_system)
+                             : 0;
   size_t limit = entry->max_dynamic_shared_memory();
   if (!entry->has_max_dynamic_shared_memory()) {
     size_t per_block = gpu_model->shared_mem_per_block();
     limit = per_block > base ? per_block - base : 0;
   }
   if (shared > limit ||
-      base + shared > gpu_model->getShaderCoreConfig()->gpgpu_shmem_size) {
+      base + shared + driver_shared >
+          gpu_model->getShaderCoreConfig()->gpgpu_shmem_size) {
     ctx->api->g_cuda_launch_stack.pop_back();
     return g_last_cudaError = cudaErrorInvalidConfiguration;
   }
@@ -1032,6 +1039,8 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
       hostFun, config.get_args(), config.grid_dim(), config.block_dim(),
       context);
   grid->set_dynamic_shared_memory(shared);
+  grid->set_driver_shared_memory(driver_shared);
+  grid->set_cluster_dim(config.cluster_dim);
   // do dynamic PDOM analysis for performance simulation scenario
   std::string kname = grid->name();
   function_info *kernel_func_info = grid->entry();
@@ -1243,11 +1252,10 @@ __host__ cudaError_t CUDARTAPI cudaMallocArrayInternal(
   (*array)->height = height;
   (*array)->size = size;
   (*array)->dimensions = 2;
-  ((*array)->devPtr32) =
-      (int)(long long)context->get_device()->get_gpgpu()->gpu_mallocarray(size);
+  (*array)->devPtr = context->get_device()->get_gpgpu()->gpu_mallocarray(size);
+  (*array)->devPtr32 = (int)(uintptr_t)(*array)->devPtr;
   printf("GPGPU-Sim PTX: cudaMallocArray: devPtr32 = %d\n",
          ((*array)->devPtr32));
-  ((*array)->devPtr) = (void *)(long long)((*array)->devPtr32);
   if (((*array)->devPtr)) {
     return g_last_cudaError = cudaSuccess;
   } else {
@@ -2067,7 +2075,8 @@ __host__ cudaError_t CUDARTAPI cudaUnbindTextureInternal(
 
 __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
     const char *hostFun, dim3 gridDim, dim3 blockDim, const void **args,
-    size_t sharedMem, cudaStream_t stream, gpgpu_context *gpgpu_ctx = NULL) {
+    size_t sharedMem, cudaStream_t stream, gpgpu_context *gpgpu_ctx = NULL,
+    dim3 clusterDim = dim3(1, 1, 1)) {
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -2081,6 +2090,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
   CUctx_st *context = GPGPUSim_Context(ctx);
   function_info *entry = context->get_kernel(hostFun);
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
+  ctx->api->g_cuda_launch_stack.back().cluster_dim = clusterDim;
   for (unsigned i = 0; i < entry->num_args(); i++) {
     std::pair<size_t, unsigned> p = entry->get_param_config(i);
     cudaSetupArgumentInternal(args[i], p.first, p.second, ctx);
@@ -2979,6 +2989,27 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernel(const char *hostFun,
   return cudaLaunchKernelInternal(hostFun, gridDim, blockDim, args, sharedMem,
                                   stream);
 }
+
+#if CUDART_VERSION >= 12000
+__host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
+    const cudaLaunchConfig_t *config, const void *func, void **args) {
+  dim3 cluster(1, 1, 1);
+  for (unsigned i = 0; i < config->numAttrs; ++i) {
+    const auto &attr = config->attrs[i];
+    if (attr.id != cudaLaunchAttributeClusterDimension)
+      return g_last_cudaError = cudaErrorNotSupported;
+    cluster = dim3(attr.val.clusterDim.x, attr.val.clusterDim.y,
+                   attr.val.clusterDim.z);
+  }
+  if (cluster.x != 1 || (cluster.y != 1 && cluster.y != 2) || cluster.z != 1 ||
+      config->gridDim.y % cluster.y)
+    return g_last_cudaError = cudaErrorInvalidConfiguration;
+  return cudaLaunchKernelInternal(
+      static_cast<const char *>(func), config->gridDim, config->blockDim,
+      const_cast<const void **>(args), config->dynamicSmemBytes, config->stream,
+      NULL, cluster);
+}
+#endif
 
 /*******************************************************************************
  *                                                                              *

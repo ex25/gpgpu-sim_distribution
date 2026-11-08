@@ -854,7 +854,69 @@ kernel_info_t::~kernel_info_t() {
 std::string kernel_info_t::name() const { return m_kernel_entry->get_name(); }
 
 size_t kernel_info_t::shared_memory_per_cta() const {
-  return ptx_sim_kernel_info(m_kernel_entry)->smem + m_dynamic_shared_memory;
+  return ptx_sim_kernel_info(m_kernel_entry)->smem + m_dynamic_shared_memory +
+         m_driver_shared_memory;
+}
+
+memory_space *kernel_info_t::create_cluster_shared(dim3 cta) {
+  auto &state = m_ptx_clusters[cluster_id(cta)];
+  unsigned rank = cluster_rank(cta);
+  state.cta[rank] = cta;
+  state.shared[rank].reset(
+      new memory_space_impl<16 * 1024>("cluster_shared", 4));
+  return state.shared[rank].get();
+}
+
+kernel_info_t::ptx_shared_target kernel_info_t::resolve_cluster_shared(
+    dim3 source_cta, uint32_t address) {
+  auto &state = m_ptx_clusters.at(cluster_id(source_cta));
+  unsigned rank = address >> 24;
+  assert(rank < 2 && state.shared[rank]);
+  return {state.shared[rank].get(), state.cta[rank], address & 0xffffff};
+}
+
+void kernel_info_t::retire_cluster_cta(dim3 cta) {
+  auto it = m_ptx_clusters.find(cluster_id(cta));
+  assert(it != m_ptx_clusters.end());
+  if (++it->second.retired == 2) {
+    assert(it->second.arrivals.empty() && it->second.rounds.empty());
+    m_ptx_clusters.erase(it);
+  }
+}
+
+void kernel_info_t::cluster_arrive(dim3 id, uint64_t epoch, unsigned count,
+                                   uint64_t cycle, unsigned latency) {
+  auto &state = m_ptx_clusters.at(id);
+  // One warp notification per collector cycle. Shared latency approximates
+  // endpoint transport; this is not a calibrated GPC network model.
+  uint64_t delivery = std::max(cycle + latency, state.last_delivery + 1);
+  state.arrivals.push_back({delivery, epoch, count});
+  state.last_delivery = delivery;
+}
+
+void kernel_info_t::service_cluster_arrivals(uint64_t cycle) {
+  for (auto &item : m_ptx_clusters) {
+    auto &state = item.second;
+    while (!state.arrivals.empty() && state.arrivals.front().cycle <= cycle) {
+      auto event = state.arrivals.front();
+      state.rounds[event.epoch].arrived += event.count;
+      state.arrivals.pop_front();
+    }
+  }
+}
+
+bool kernel_info_t::cluster_wait_ready(dim3 id, uint64_t epoch) const {
+  const auto &rounds = m_ptx_clusters.at(id).rounds;
+  auto it = rounds.find(epoch);
+  return it != rounds.end() && it->second.arrived == 2 * threads_per_cta();
+}
+
+void kernel_info_t::cluster_wait_release(dim3 id, uint64_t epoch,
+                                         unsigned count) {
+  auto &rounds = m_ptx_clusters.at(id).rounds;
+  auto &round = rounds.at(epoch);
+  round.released += count;
+  if (round.released == 2 * threads_per_cta()) rounds.erase(epoch);
 }
 
 // Jin: parent and child kernel management for CDP

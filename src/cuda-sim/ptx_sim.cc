@@ -211,6 +211,13 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       // Hardware clock counter is incremented at half the shader clock
       // frequency - divide by 2 (Henry '10)
       return (m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle) * 2;
+    case CLUSTER_CTARANK_REG:
+      return m_kernel.cluster_rank(m_ctaid);
+    case CLUSTER_CTAID_REG: {
+      dim3 local = m_kernel.cluster_ctaid(m_ctaid);
+      assert(dim_mod < 3);
+      return dim_mod == 0 ? local.x : dim_mod == 1 ? local.y : local.z;
+    }
     case CTAID_REG:
       assert(dim_mod < 3);
       if (dim_mod == 0) return m_ctaid.x;
@@ -287,8 +294,7 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       feature_not_implemented("%pm");
       return 0;
     case SMID_REG:
-      feature_not_implemented("%smid");
-      return 0;
+      return get_hw_sid();
     case TID_REG:
       assert(dim_mod < 3);
       if (dim_mod == 0) return m_tid.x;

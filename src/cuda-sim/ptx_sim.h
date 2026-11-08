@@ -248,7 +248,7 @@ class ptx_version {
     m_sm_version_str = sm_ver;
     check_target_extension(ext);
     check_target_extension(ext2);
-    sscanf(sm_ver, "%u", &m_sm_version);
+    sscanf(sm_ver, "sm_%u", &m_sm_version);
     m_sm_version_valid = true;
   }
   float ver() const {

@@ -151,6 +151,7 @@ class kernel_config {
   void set_arg(const void *arg, size_t size, size_t offset) {
     m_args.push_front(gpgpu_ptx_sim_arg(arg, size, offset));
   }
+  dim3 cluster_dim = dim3(1, 1, 1);
   size_t shared_mem() const { return m_sharedMem; }
   dim3 grid_dim() const { return m_GridDim; }
   dim3 block_dim() const { return m_BlockDim; }
