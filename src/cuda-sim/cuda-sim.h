@@ -46,6 +46,8 @@ extern const char *g_gpgpusim_version_string;
 extern int g_debug_execution;
 
 extern void print_splash();
+void mbarrier_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst);
+void mbarrier_complete(const warp_inst_t &inst, core_t *core, unsigned latency);
 void cp_async_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst);
 void collective_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst);
 

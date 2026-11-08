@@ -580,7 +580,8 @@ void ptx_instruction::set_fp_or_int_archop() {
       (m_opcode == BAR_OP) || (m_opcode == RET_OP) || (m_opcode == RETP_OP) ||
       (m_opcode == NOP_OP) || (m_opcode == EXIT_OP) || (m_opcode == CALLP_OP) ||
       (m_opcode == CALL_OP) || (m_opcode == TRAP_OP) ||
-      m_opcode == CLUSTER_ARRIVE_OP || m_opcode == CLUSTER_WAIT_OP) {
+      m_opcode == CLUSTER_ARRIVE_OP || m_opcode == CLUSTER_WAIT_OP ||
+      m_opcode == MBARRIER_FENCE_OP) {
     // do nothing
   } else if (m_opcode == ISSPACEP_OP) {
     oprnd_type = INT_OP;
@@ -604,7 +605,7 @@ void ptx_instruction::set_fp_or_int_archop() {
 void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
   if (m_opcode == ISSPACEP_OP || m_opcode == CLUSTER_ARRIVE_OP ||
-      m_opcode == CLUSTER_WAIT_OP)
+      m_opcode == CLUSTER_WAIT_OP || m_opcode == MBARRIER_FENCE_OP)
     return;
   if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
       (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
@@ -813,6 +814,48 @@ void ptx_instruction::set_opcode_and_latency() {
       assert(!(has_memory_read() && has_memory_write()));
       if (has_memory_read()) op = LOAD_OP;
       if (has_memory_write()) op = STORE_OP;
+      break;
+    case MBARRIER_INIT_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_INIT;
+      space = shared_space;
+      break;
+    case MBARRIER_ARRIVE_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_ARRIVE;
+      space = shared_space;
+      break;
+    case MBARRIER_REMOTE_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_ARRIVE;
+      space = shared_space;
+      break;
+    case MBARRIER_EXPECT_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_EXPECT_TX;
+      space = shared_space;
+      break;
+    case MBARRIER_ARRIVE_EXPECT_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_ARRIVE_EXPECT_TX;
+      space = shared_space;
+      break;
+    case MBARRIER_WAIT_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_TRY_WAIT;
+      space = shared_space;
+      break;
+    case MBARRIER_FENCE_OP:
+      m_ptx_mbarrier = true;
+      op = SYNCS_OP;
+      m_syncs_op = SYNCS_INIT_FENCE;
+      space = shared_space;
       break;
     case CLUSTER_ARRIVE_OP:
       m_ptx_cluster_barrier = 1;
@@ -1223,7 +1266,8 @@ void ptx_instruction::pre_decode() {
         }
       }
     } else {
-      if (m_opcode == CP_ASYNC_OP && o.is_memory_operand()) {
+      if ((m_opcode == CP_ASYNC_OP || m_ptx_mbarrier) &&
+          o.is_memory_operand()) {
         if (o.get_symbol()->type()->get_key().is_reg()) {
           in[m] = o.reg_num();
           arch_reg.src[m++] = o.arch_reg_num();
@@ -1890,7 +1934,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // Tensorcore is warp synchronous operation. So these instructions needs
       // to be executed only once. To make the simulation faster removing the
       // redundant tensorcore operation
-      if (!pI->is_cp_async() && !pI->is_warp_collective() &&
+      if (!pI->m_ptx_mbarrier && !pI->is_cp_async() &&
+          !pI->is_warp_collective() &&
           (!tensorcore_op(inst_opcode) || lane_id == 0)) {
         switch (inst_opcode) {
 #define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
@@ -2063,7 +2108,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
 
     // "Return values"
-    if (!skip && !pI->is_cp_async()) {
+    if (!skip && !pI->m_ptx_mbarrier && !pI->is_cp_async()) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);

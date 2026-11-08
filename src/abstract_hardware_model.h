@@ -242,14 +242,15 @@ typedef enum syncs_op_t {
   SYNCS_TEST_WAIT,      // Not implemented, modeled as another barrier
   SYNCS_TRY_WAIT,       // Not implemented, modeled as another barrier
   SYNCS_PENDING_COUNT,  // Not implemented
+  SYNCS_INIT_FENCE,
   SYNCS_MAX_ENUM_NO_USED
 } syncs_op;
 
 const std::string syncs_op_to_string[] = {
-    "SYNCS_INIT",          "SYNCS_INVALIDATE",      "SYNCS_EXPECT_TX",
-    "SYNCS_COMPELTE_TX",   "SYNCS_ARRIVE",          "SYNCS_ARRIVE_EXPECT_TX",
-    "SYNCS_ARRIVE_DROP",   "SYNCS_TEST_WAIT",       "SYNCS_TRY_WAIT",
-    "SYNCS_PENDING_COUNT", "SYNCS_MAX_ENUM_NO_USED"};
+    "SYNCS_INIT",          "SYNCS_INVALIDATE", "SYNCS_EXPECT_TX",
+    "SYNCS_COMPELTE_TX",   "SYNCS_ARRIVE",     "SYNCS_ARRIVE_EXPECT_TX",
+    "SYNCS_ARRIVE_DROP",   "SYNCS_TEST_WAIT",  "SYNCS_TRY_WAIT",
+    "SYNCS_PENDING_COUNT", "SYNCS_INIT_FENCE", "SYNCS_MAX_ENUM_NO_USED"};
 
 typedef struct {
   uint32_t addr[MAX_WARP_SIZE];
@@ -348,7 +349,20 @@ class mbarrier_t {
 
   void drop_on(uint32_t count) { this->expected_arrival_thread_count -= count; }
 
-  void expect_on(uint32_t txCount) { this->tx_count += txCount; }
+  void expect_on(uint32_t txCount) {
+    this->tx_count += txCount;
+    try_phase_transition();
+  }
+
+  // Apply both counters before testing completion: a combined operation must
+  // never finish a zero-byte phase between its two updates.
+  void arrive_expect_on(uint32_t count, uint32_t txCount) {
+    this->tx_count += txCount;
+    this->pending_thread_count -= count;
+    try_phase_transition();
+  }
+
+  bool waiting_parity(uint32_t parity) const { return (phase & 1) == parity; }
 
   void complete_on(uint32_t txCount) {
     // complete-on op triggers phase transition
@@ -587,6 +601,8 @@ class kernel_info_t {
   void cluster_arrive(dim3 id, uint64_t epoch, unsigned count, uint64_t cycle,
                       unsigned latency);
   void service_cluster_arrivals(uint64_t cycle);
+  void cluster_mbarrier_arrive(dim3 source, uint32_t address, unsigned count,
+                               uint64_t cycle, unsigned latency);
   bool cluster_wait_ready(dim3 id, uint64_t epoch) const;
   void cluster_wait_release(dim3 id, uint64_t epoch, unsigned count);
 
@@ -705,6 +721,7 @@ class kernel_info_t {
     struct arrival {
       uint64_t cycle, epoch;
       unsigned count;
+      mbarrier_t *barrier = nullptr;
     };
     std::deque<arrival> arrivals;
     uint64_t last_delivery = 0;
@@ -1862,6 +1879,7 @@ class warp_inst_t : public inst_t {
   // Ni: add boolean to indicate whether the instruction is ldgsts
   bool m_is_ldgsts;
   // PTX copy/commit/wait are separate from trace DEPBAR classification.
+  bool m_ptx_mbarrier = false;
   unsigned m_ptx_cluster_barrier = 0;  // 1 = arrive, 2 = wait
   ptx_cp_async_kind m_ptx_cp_async_op = PTX_CP_ASYNC_NONE;
   unsigned m_ptx_cp_async_wait = 0;

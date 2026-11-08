@@ -899,10 +899,29 @@ void kernel_info_t::service_cluster_arrivals(uint64_t cycle) {
     auto &state = item.second;
     while (!state.arrivals.empty() && state.arrivals.front().cycle <= cycle) {
       auto event = state.arrivals.front();
-      state.rounds[event.epoch].arrived += event.count;
+      if (event.barrier) {
+        assert(uint64_t(event.barrier->get_phase()) == event.epoch);
+        event.barrier->arrive_on(event.count);
+      } else {
+        state.rounds[event.epoch].arrived += event.count;
+      }
       state.arrivals.pop_front();
     }
   }
+}
+
+void kernel_info_t::cluster_mbarrier_arrive(dim3 source, uint32_t address,
+                                            unsigned count, uint64_t cycle,
+                                            unsigned latency) {
+  auto target = resolve_cluster_shared(source, address);
+  auto id = cluster_id(target.cta);
+  auto *barrier =
+      get_cluster_mbarrier_lookup_table(id).lookup_clustermbar(address);
+  auto &state = m_ptx_clusters.at(id);
+  uint64_t delivery = std::max(cycle + latency, state.last_delivery + 1);
+  state.arrivals.push_back(
+      {delivery, uint64_t(barrier->get_phase()), count, barrier});
+  state.last_delivery = delivery;
 }
 
 bool kernel_info_t::cluster_wait_ready(dim3 id, uint64_t epoch) const {
@@ -1300,6 +1319,7 @@ void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
   if (pI->is_warp_collective() && inst.active_count())
     collective_impl(pI, this, inst);
   if (pI->is_cp_async() && inst.active_count()) cp_async_impl(pI, this, inst);
+  if (pI->m_ptx_mbarrier && inst.active_count()) mbarrier_impl(pI, this, inst);
 }
 
 bool core_t::ptx_thread_done(unsigned hw_thread_id) const {

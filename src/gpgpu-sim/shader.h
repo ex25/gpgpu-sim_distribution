@@ -151,6 +151,7 @@ class shd_warp_t {
     for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
+    m_ptx_mbarrier_pending = false;
     m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
@@ -207,6 +208,7 @@ class shd_warp_t {
     for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
     m_ptx_cluster_epoch = 0;
     m_ptx_cluster_waiting = false;
+    m_ptx_mbarrier_pending = false;
     m_ptx_cluster_kernel = nullptr;
 
     // Ni: Clear m_ldgdepbar_buf
@@ -362,6 +364,7 @@ class shd_warp_t {
   void set_imiss_pending() { m_imiss_pending = true; }
   void clear_imiss_pending() { m_imiss_pending = false; }
 
+  bool m_ptx_mbarrier_pending = false;
   bool stores_done() const { return m_stores_outstanding == 0; }
   void inc_store_req() { m_stores_outstanding++; }
   void dec_store_req() {
@@ -1999,12 +2002,11 @@ class ldst_unit : public pipelined_simd_unit {
         get_mbarrier(cluster_cta_identifier.cluster_id, bar_addr);
     assert(mbarrier != nullptr &&
            "Receives null mbarrier pointer from get_mbarrier");
-    uint32_t current_parity = mbarrier->get_phase() % 2;
     // For SASS phase parity bit, judging by ubench register value dump,
     // it seems the parity bit is at bit 31, instead of bit 0
     // So we need to shift right by 31 bits
     uint32_t prior_parity = prior_phase >> 31;
-    return current_parity == prior_parity;
+    return mbarrier->waiting_parity(prior_parity);
   }
 
   virtual void active_lanes_in_pipeline();
@@ -2796,6 +2798,9 @@ class shader_core_ctx : public core_t {
   void get_pdom_stack_top_info(unsigned tid, unsigned *pc, unsigned *rpc) const;
   float get_current_occupancy(unsigned long long &active,
                               unsigned long long &total) const;
+  void complete_ptx_mbarrier(unsigned warp_id) {
+    m_warp[warp_id]->m_ptx_mbarrier_pending = false;
+  }
   const shd_warp_t *get_warp(unsigned warp_id) const { return m_warp[warp_id]; }
   shd_warp_t *get_warp_nonconst(unsigned warp_id) { return m_warp[warp_id]; }
 

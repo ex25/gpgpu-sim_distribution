@@ -6730,3 +6730,116 @@ void cluster_bar_impl(const ptx_instruction *p, core_t *core, warp_inst_t w) {
   // shader_core_ctx::issue_warp, after per-lane predicate evaluation.
   assert(!core->get_gpu()->is_functional_sim());
 }
+
+// Read PTX operands after per-lane predication, into this dynamic instruction.
+// State changes and predicate results happen only at the LSU service event.
+void mbarrier_impl(const ptx_instruction *p, core_t *core, warp_inst_t &inst) {
+  assert(!core->get_gpu()->is_functional_sim());
+  syncs_operand operand{};
+  for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+    if (!inst.active(lane)) continue;
+    auto *thread =
+        core->get_thread_info()[inst.warp_id() * MAX_WARP_SIZE + lane];
+    auto value = [&](unsigned n) {
+      const auto &op = p->operand_lookup(n);
+      return thread->get_operand_value(op, op, U32_TYPE, thread, 0).u32;
+    };
+    if (p->get_opcode() == MBARRIER_FENCE_OP) continue;
+    unsigned address_operand = (inst.get_syncs_op() == SYNCS_INIT ||
+                                inst.get_syncs_op() == SYNCS_EXPECT_TX)
+                                   ? 0
+                                   : 1;
+    uint32_t address = value(address_operand);
+    // Local offsets belong to the executing CTA, including cluster rank 1.
+    if (p->get_opcode() != MBARRIER_REMOTE_OP)
+      address |= thread->get_kernel().cluster_rank(thread->get_ctaid()) << 24;
+    operand.addr[lane] = address;
+    inst.set_addr(lane, address);
+    switch (inst.get_syncs_op()) {
+      case SYNCS_INIT:
+        operand.u.init.count[lane] = value(1);
+        break;
+      case SYNCS_EXPECT_TX:
+        operand.u.expect_tx.txCount[lane] = value(1);
+        break;
+      case SYNCS_ARRIVE:
+        operand.u.arrive.count[lane] =
+            p->get_num_operands() == 3 ? value(2) : 1;
+        break;
+      case SYNCS_ARRIVE_EXPECT_TX:
+        operand.u.arrive.count[lane] = 1;
+        operand.u.arrive.txCount[lane] = value(2);
+        break;
+      case SYNCS_TRY_WAIT:
+        operand.u.wait.phase[lane] = value(2);
+        // PTX permits try_wait to return false before its optional time hint.
+        // Both forms currently poll once at LSU service; neither blocks LSU.
+        if (p->get_num_operands() == 4) (void)value(3);
+        break;
+      default:
+        abort();
+    }
+  }
+  inst.set_syncs_operand(operand);
+}
+
+void mbarrier_complete(const warp_inst_t &inst, core_t *core,
+                       unsigned latency) {
+  const auto *p = static_cast<const ptx_instruction *>(
+      core->get_gpu()->gpgpu_ctx->ptx_fetch_inst(inst.pc));
+  const auto operand = inst.get_syncs_operand();
+  for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+    if (!inst.active(lane)) continue;
+    auto *thread =
+        core->get_thread_info()[inst.warp_id() * MAX_WARP_SIZE + lane];
+    auto &kernel = thread->get_kernel();
+    auto id = kernel.cluster_id(thread->get_ctaid());
+    auto &table = kernel.get_cluster_mbarrier_lookup_table(id);
+    uint32_t address = operand.addr[lane];
+    if (inst.get_syncs_op() == SYNCS_INIT_FENCE) {
+      // Prior init instructions have completed on this warp before the fence
+      // can issue. Completion of this LSU service publishes them; the program
+      // still needs its cluster arrive/wait before another CTA uses them.
+      continue;
+    }
+    if (inst.get_syncs_op() == SYNCS_INIT) {
+      table.insert_mbarrier(std::make_unique<mbarrier_t>(
+          ClusterCTAIdentifier(id, kernel.cluster_rank(thread->get_ctaid())),
+          thread->get_ctaid(), address, operand.u.init.count[lane]));
+      continue;
+    }
+    if (p->get_opcode() == MBARRIER_REMOTE_OP) {
+      kernel.cluster_mbarrier_arrive(thread->get_ctaid(), address,
+                                     operand.u.arrive.count[lane],
+                                     core->get_gpu()->global_cycle(), latency);
+      continue;
+    }
+    auto *barrier = table.lookup_clustermbar(address);
+    uint32_t prior_phase = barrier->get_phase();
+    switch (inst.get_syncs_op()) {
+      case SYNCS_EXPECT_TX:
+        barrier->expect_on(operand.u.expect_tx.txCount[lane]);
+        break;
+      case SYNCS_ARRIVE:
+      case SYNCS_ARRIVE_EXPECT_TX:
+        barrier->arrive_expect_on(operand.u.arrive.count[lane],
+                                  operand.u.arrive.txCount[lane]);
+        if (!p->dst().is_non_arch_reg()) {
+          ptx_reg_t token;
+          token.u64 = prior_phase;
+          thread->set_operand_value(p->dst(), token, B64_TYPE, thread, p);
+        }
+        break;
+      case SYNCS_TRY_WAIT: {
+        ptx_reg_t result;
+        // GPGPU-Sim predicates use an inverted low (zero-flag) bit.
+        result.pred =
+            barrier->waiting_parity(operand.u.wait.phase[lane]) ? 1 : 0;
+        thread->set_operand_value(p->dst(), result, PRED_TYPE, thread, p);
+        break;
+      }
+      default:
+        abort();
+    }
+  }
+}

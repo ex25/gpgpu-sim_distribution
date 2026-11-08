@@ -1069,6 +1069,8 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
+  if ((*pipe_reg)->m_ptx_mbarrier && (*pipe_reg)->active_count())
+    m_warp[warp_id]->m_ptx_mbarrier_pending = true;
 
   if ((*pipe_reg)->m_ptx_cluster_barrier && (*pipe_reg)->active_count()) {
     auto &warp = *m_warp[warp_id];
@@ -1599,8 +1601,15 @@ void scheduler_unit::cycle() {
                                       m_id) &&
                   (!diff_exec_units ||
                    previous_issued_inst_exec_type != exec_unit_type_t::MEM)) {
-                // Check TRYWAIT before issuing - if not ready, skip issue
-                if (pI->is_syncs_try_wait() &&
+                // Release operations wait for this warp's earlier memory
+                // accesses. PTX operands are evaluated only after issue.
+                if (pI->m_ptx_mbarrier &&
+                    (pI->is_syncs_arrive() ||
+                     pI->get_syncs_op() == SYNCS_INIT_FENCE) &&
+                    (!warp(warp_id).stores_done() ||
+                     m_scoreboard->pendingWrites(warp_id)))
+                  break;
+                if (!pI->m_ptx_mbarrier && pI->is_syncs_try_wait() &&
                     !m_shader->check_trywait_ready(pI, warp_id)) {
                   // mbarrier not ready, nanosleep already set, skip issue
                   break;
@@ -3048,6 +3057,7 @@ bool ldst_unit::writeback_complete(warp_inst_t &inst) {
     }
   }
   if (insn_completed) {
+    if (inst.m_ptx_mbarrier) m_core->complete_ptx_mbarrier(inst.warp_id());
     m_core->warp_inst_complete(inst);
     if (inst.m_is_ldgsts) {
       // If the LDGSTS instruction is done, we need to erase it from the
@@ -3222,137 +3232,146 @@ void ldst_unit::writeback() {
               ClusterCTAIdentifier(syncs_inst->get_cuda_cluster_id(),
                                    syncs_inst->get_cuda_cluster_rank());
           unsigned sid = m_core->get_sid();
-          switch (op) {
-            case SYNCS_INIT:
-              LDST_DPRINTF("Handling syncs init instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  LDST_DPRINTF(
-                      "Handling syncs init instruction for thread %d in "
-                      "writeback with count %d\n",
-                      i, operand.u.init.count[i]);
-                  mbarrier_init(cuda_cluster_cta_identifier, cuda_cta_ids, i,
-                                operand);
-                  // mbarrier init is done once for all threads in the warp
-                  break;
+          if (syncs_inst->m_ptx_mbarrier) {
+            mbarrier_complete(*syncs_inst, m_core, m_config->smem_latency);
+          } else
+            switch (op) {
+              case SYNCS_INIT:
+                LDST_DPRINTF("Handling syncs init instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    LDST_DPRINTF(
+                        "Handling syncs init instruction for thread %d in "
+                        "writeback with count %d\n",
+                        i, operand.u.init.count[i]);
+                    mbarrier_init(cuda_cluster_cta_identifier, cuda_cta_ids, i,
+                                  operand);
+                    // mbarrier init is done once for all threads in the warp
+                    break;
+                  }
                 }
-              }
-              break;
-            case SYNCS_INVALIDATE:
-              LDST_DPRINTF(
-                  "Handling syncs invalidate instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  LDST_DPRINTF(
-                      "Handling syncs invalidate instruction for thread %d "
-                      "in writeback\n",
-                      i);
-                  mbarrier_invalidate(cuda_cluster_cta_identifier, cuda_cta_ids,
-                                      operand.addr[i]);
-                  // mbarrier init is done once for all threads in the warp
-                  break;
+                break;
+              case SYNCS_INVALIDATE:
+                LDST_DPRINTF(
+                    "Handling syncs invalidate instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    LDST_DPRINTF(
+                        "Handling syncs invalidate instruction for thread %d "
+                        "in writeback\n",
+                        i);
+                    mbarrier_invalidate(cuda_cluster_cta_identifier,
+                                        cuda_cta_ids, operand.addr[i]);
+                    // mbarrier init is done once for all threads in the warp
+                    break;
+                  }
                 }
-              }
-              break;
-            case SYNCS_EXPECT_TX:
-              LDST_DPRINTF(
-                  "Handling syncs expect tx instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  LDST_DPRINTF(
-                      "Handling syncs expect tx instruction for thread %d "
-                      "in writeback with tx count %d\n",
-                      i, operand.u.expect_tx.txCount[i]);
-                  mbarrier_expect_tx(cuda_cluster_cta_identifier, cuda_cta_ids,
-                                     operand.addr[i],
-                                     operand.u.expect_tx.txCount[i]);
-                }
-              }
-              break;
-            case SYNCS_COMPELTE_TX:
-              LDST_DPRINTF(
-                  "Handling syncs complete tx instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  LDST_DPRINTF(
-                      "Handling syncs complete tx instruction for thread "
-                      "%d in writeback with tx count %d\n",
-                      i, operand.u.complete_tx.txCount[i]);
-                  mbarrier_complete_tx(cuda_cluster_cta_identifier,
+                break;
+              case SYNCS_EXPECT_TX:
+                LDST_DPRINTF(
+                    "Handling syncs expect tx instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    LDST_DPRINTF(
+                        "Handling syncs expect tx instruction for thread %d "
+                        "in writeback with tx count %d\n",
+                        i, operand.u.expect_tx.txCount[i]);
+                    mbarrier_expect_tx(cuda_cluster_cta_identifier,
                                        cuda_cta_ids, operand.addr[i],
-                                       operand.u.complete_tx.txCount[i], false,
-                                       0);
+                                       operand.u.expect_tx.txCount[i]);
+                  }
                 }
-              }
-              break;
-            case SYNCS_ARRIVE:
-              // No transaction byte count
-              LDST_DPRINTF("Handling syncs arrive instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  // For certain cases, the SYNCS instruction will have a A0TR
-                  // modifier, meaning no tx is expected
-                  // assert(operand.u.arrive.txCount[i] == 0 && "Arrive with no
-                  // tx count modifier should have no transaction byte count");
-                  LDST_DPRINTF(
-                      "Handling syncs arrive instruction for thread %d in "
-                      "writeback with arrival count %d and tx count %d\n",
-                      i, operand.u.arrive.count[i],
-                      operand.u.arrive.txCount[i]);
-                  mbarrier_arrive(cuda_cluster_cta_identifier, cuda_cta_ids,
-                                  operand.addr[i], operand.u.arrive.count[i],
-                                  operand.u.arrive.txCount[i]);
+                break;
+              case SYNCS_COMPELTE_TX:
+                LDST_DPRINTF(
+                    "Handling syncs complete tx instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    LDST_DPRINTF(
+                        "Handling syncs complete tx instruction for thread "
+                        "%d in writeback with tx count %d\n",
+                        i, operand.u.complete_tx.txCount[i]);
+                    mbarrier_complete_tx(cuda_cluster_cta_identifier,
+                                         cuda_cta_ids, operand.addr[i],
+                                         operand.u.complete_tx.txCount[i],
+                                         false, 0);
+                  }
                 }
-              }
-              break;
-            case SYNCS_ARRIVE_EXPECT_TX:
-              LDST_DPRINTF(
-                  "Handling syncs arrive expect tx instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  assert(operand.u.arrive.count[i] == 1 &&
-                         "Arrive with expect tx modifier should have exactly "
-                         "one thread");
-                  LDST_DPRINTF(
-                      "Handling syncs arrive expect tx instruction for thread "
-                      "%d in writeback with arrival count %d and tx count %d\n",
-                      i, operand.u.arrive.count[i],
-                      operand.u.arrive.txCount[i]);
-                  mbarrier_arrive(cuda_cluster_cta_identifier, cuda_cta_ids,
-                                  operand.addr[i], operand.u.arrive.count[i],
-                                  operand.u.arrive.txCount[i]);
+                break;
+              case SYNCS_ARRIVE:
+                // No transaction byte count
+                LDST_DPRINTF(
+                    "Handling syncs arrive instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    // For certain cases, the SYNCS instruction will have a A0TR
+                    // modifier, meaning no tx is expected
+                    // assert(operand.u.arrive.txCount[i] == 0 && "Arrive with
+                    // no tx count modifier should have no transaction byte
+                    // count");
+                    LDST_DPRINTF(
+                        "Handling syncs arrive instruction for thread %d in "
+                        "writeback with arrival count %d and tx count %d\n",
+                        i, operand.u.arrive.count[i],
+                        operand.u.arrive.txCount[i]);
+                    mbarrier_arrive(cuda_cluster_cta_identifier, cuda_cta_ids,
+                                    operand.addr[i], operand.u.arrive.count[i],
+                                    operand.u.arrive.txCount[i]);
+                  }
                 }
-              }
-              break;
-            case SYNCS_ARRIVE_DROP:
-              LDST_DPRINTF(
-                  "Handling syncs arrive drop instruction in writeback\n");
-              for (int i = 0; i < MAX_WARP_SIZE; i++) {
-                if (syncs_inst->active(i)) {
-                  LDST_DPRINTF(
-                      "Handling syncs arrive drop instruction for thread %d in "
-                      "writeback with arrival count %d and tx count %d\n",
-                      i, operand.u.arrive_drop.count[i],
-                      operand.u.arrive_drop.txCount[i]);
-                  mbarrier_arrive_drop(cuda_cluster_cta_identifier,
-                                       cuda_cta_ids, operand.addr[i],
-                                       operand.u.arrive_drop.count[i],
-                                       operand.u.arrive_drop.txCount[i]);
+                break;
+              case SYNCS_ARRIVE_EXPECT_TX:
+                LDST_DPRINTF(
+                    "Handling syncs arrive expect tx instruction in "
+                    "writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    assert(operand.u.arrive.count[i] == 1 &&
+                           "Arrive with expect tx modifier should have exactly "
+                           "one thread");
+                    LDST_DPRINTF(
+                        "Handling syncs arrive expect tx instruction for "
+                        "thread "
+                        "%d in writeback with arrival count %d and tx count "
+                        "%d\n",
+                        i, operand.u.arrive.count[i],
+                        operand.u.arrive.txCount[i]);
+                    mbarrier_arrive(cuda_cluster_cta_identifier, cuda_cta_ids,
+                                    operand.addr[i], operand.u.arrive.count[i],
+                                    operand.u.arrive.txCount[i]);
+                  }
                 }
-              }
-              break;
-            case SYNCS_TEST_WAIT:
-              // Nothing to do here
-              break;
-            case SYNCS_TRY_WAIT:
-              // Nothing to do here
-              break;
-            case SYNCS_PENDING_COUNT:
-              // Not supported, treat it as a no-op
-              break;
-            default:
-              assert(false && "Unsupported syncs opcode");
-          }
+                break;
+              case SYNCS_ARRIVE_DROP:
+                LDST_DPRINTF(
+                    "Handling syncs arrive drop instruction in writeback\n");
+                for (int i = 0; i < MAX_WARP_SIZE; i++) {
+                  if (syncs_inst->active(i)) {
+                    LDST_DPRINTF(
+                        "Handling syncs arrive drop instruction for thread %d "
+                        "in "
+                        "writeback with arrival count %d and tx count %d\n",
+                        i, operand.u.arrive_drop.count[i],
+                        operand.u.arrive_drop.txCount[i]);
+                    mbarrier_arrive_drop(cuda_cluster_cta_identifier,
+                                         cuda_cta_ids, operand.addr[i],
+                                         operand.u.arrive_drop.count[i],
+                                         operand.u.arrive_drop.txCount[i]);
+                  }
+                }
+                break;
+              case SYNCS_TEST_WAIT:
+                // Nothing to do here
+                break;
+              case SYNCS_TRY_WAIT:
+                // Nothing to do here
+                break;
+              case SYNCS_PENDING_COUNT:
+                // Not supported, treat it as a no-op
+                break;
+              default:
+                assert(false && "Unsupported syncs opcode");
+            }
 
           // Wrapping off syncs instruction
           m_next_wb = *m_pipeline_reg[0];
@@ -3822,10 +3841,7 @@ uint32_t ldst_unit::mbarrier_arrive(ClusterCTAIdentifier cluster_cta_identifier,
   assert(mbarrier != nullptr &&
          "Receives null mbarrier pointer from get_mbarrier");
   uint32_t prior_phase = mbarrier->get_phase();
-  if (tx_count > 0) {
-    mbarrier->expect_on(tx_count);
-  }
-  mbarrier->arrive_on(count);
+  mbarrier->arrive_expect_on(count, tx_count);
   return prior_phase;
 }
 
@@ -3843,11 +3859,8 @@ uint32_t ldst_unit::mbarrier_arrive_drop(
          "Receives null mbarrier pointer from get_mbarrier");
   uint32_t prior_phase = mbarrier->get_phase();
   // arrive-on operation happens the last
-  if (tx_count > 0) {
-    mbarrier->expect_on(tx_count);
-  }
   mbarrier->drop_on(count);
-  mbarrier->arrive_on(count);
+  mbarrier->arrive_expect_on(count, tx_count);
   return prior_phase;
 }
 
@@ -5074,7 +5087,7 @@ bool shd_warp_t::hardware_done() const {
 }
 
 bool shd_warp_t::waiting() {
-  bool waiting = false;
+  bool waiting = m_ptx_mbarrier_pending;
   if (m_ptx_cluster_waiting) {
     auto *kernel = m_ptx_cluster_kernel;
     if (kernel->cluster_wait_ready(m_ptx_cluster_id, m_ptx_cluster_epoch)) {
