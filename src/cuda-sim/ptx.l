@@ -61,6 +61,7 @@ int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
 %s IN_COMMENT
 %x IN_FUNC_DECL
 %x NOT_OPCODE
+%x IN_DEBUG_SECTION
 %%
 
 abs	TC; yylval->int_value = ABS_OP; return OPCODE;
@@ -70,7 +71,6 @@ addc    TC; yylval->int_value = ADDC_OP; return OPCODE;
 and	TC; yylval->int_value = AND_OP; return OPCODE;
 andn	TC; yylval->int_value = ANDN_OP; return OPCODE;
 atom	TC; yylval->int_value = ATOM_OP; return OPCODE;
-bar.warp 	TC; yylval->int_value = NOP_OP; return OPCODE;
 bar 	TC; yylval->int_value = BAR_OP; return OPCODE;
 barrier	TC; yylval->int_value = BAR_OP; return OPCODE;
 bfe     TC; yylval->int_value = BFE_OP; return OPCODE;
@@ -162,6 +162,8 @@ vset    TC; yylval->int_value = VSET_OP; return OPCODE;
 vshl    TC; yylval->int_value = VSHL_OP; return OPCODE;
 vshr    TC; yylval->int_value = VSHR_OP; return OPCODE;
 vsub    TC; yylval->int_value = VSUB_OP; return OPCODE;
+redux TC; yylval->int_value = REDUX_OP; return OPCODE;
+elect TC; yylval->int_value = ELECT_OP; return OPCODE;
 vote	TC; yylval->int_value = VOTE_OP; return OPCODE;
 activemask TC; yylval->int_value = ACTIVEMASK_OP; return OPCODE;
 xor     TC; yylval->int_value = XOR_OP; return OPCODE;
@@ -223,6 +225,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.pragma TC; return PRAGMA_DIRECTIVE;
 \.reg    TC; return REG_DIRECTIVE;
 \.reqntid TC; return REQNTID_DIRECTIVE;
+\.section[ \t]+\.debug_[a-z_]+ TC; BEGIN(IN_DEBUG_SECTION);
 \.section TC; return SECTION_DIRECTIVE;
 \.shared  TC; return SHARED_DIRECTIVE;
 \.sreg   TC; return SREG_DIRECTIVE;
@@ -283,6 +286,8 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.u16  TC;  return U16_TYPE;
 \.u32  TC;  return U32_TYPE;
 \.u64  TC;  return U64_TYPE;
+\.bf16 TC; return BF16_TYPE;
+\.bf16x2 TC; return BF16X2_TYPE;
 \.f16  TC;  return F16_TYPE;
 \.f16x2  TC;  return F16_TYPE; /* TODO: figure out what this should really be */
 \.f32  TC;  return F32_TYPE;
@@ -354,6 +359,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.wide  TC; return WIDE_OPTION;
 \.uni	TC; return UNI_OPTION;
 
+\.warp TC; return WARP_OPTION;
+\.shiftamt TC; return SHIFTAMT_OPTION;
+\.L1::evict_first TC; return EVICT_FIRST_OPTION;
+\.L1::evict_last TC; return EVICT_LAST_OPTION;
 \.sync TC; return SYNC_OPTION;
 \.arrive TC; return ARRIVE_OPTION;
 \.red TC; return RED_OPTION;
@@ -469,6 +478,11 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 "\"" 	TC; BEGIN(INITIAL); return STRING;
 [^\"]*	TC; yylval->string_value = strdup(yytext);
 }
+
+ /* DWARF blocks have one brace level and carry no executable data. */
+<IN_DEBUG_SECTION>[^}\n]+ TC;
+<IN_DEBUG_SECTION>\n recognizer->col=0;
+<IN_DEBUG_SECTION>"}" TC; BEGIN(INITIAL);
 
 <*>\t@@DWARF.*\n
 

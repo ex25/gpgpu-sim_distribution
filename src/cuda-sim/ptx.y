@@ -101,6 +101,8 @@ class ptx_recognizer;
 %token  U16_TYPE
 %token  U32_TYPE
 %token  U64_TYPE
+%token  BF16_TYPE
+%token  BF16X2_TYPE
 %token  F16_TYPE
 %token  F32_TYPE
 %token  F64_TYPE
@@ -174,6 +176,10 @@ class ptx_recognizer;
 %token SAT_OPTION
 %token FTZ_OPTION
 %token NEG_OPTION
+%token WARP_OPTION
+%token SHIFTAMT_OPTION
+%token EVICT_FIRST_OPTION
+%token EVICT_LAST_OPTION
 %token SYNC_OPTION
 %token RED_OPTION
 %token ARRIVE_OPTION
@@ -255,6 +261,10 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->func_header_info_int(",", $4);
 										recognizer->func_header_info_int(",", $6);
                                                                                 recognizer->maxnt_id($2, $4, $6);}
+	| REQNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {recognizer->func_header_info_int(".reqntid", $2);
+                                        recognizer->func_header_info_int(",", $4);
+                                        recognizer->func_header_info_int(",", $6);
+                                        recognizer->maxnt_id($2, $4, $6);}
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim: Warning: .minnctapersm ignored. \n"); }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim: Warning: .maxnctapersm ignored. \n"); }
 	;
@@ -401,6 +411,8 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| U16_TYPE   { recognizer->add_scalar_type_spec( U16_TYPE ); }
 	| U32_TYPE   { recognizer->add_scalar_type_spec( U32_TYPE ); }
 	| U64_TYPE   { recognizer->add_scalar_type_spec( U64_TYPE ); }
+	| BF16_TYPE { recognizer->add_scalar_type_spec( BF16_TYPE ); }
+	| BF16X2_TYPE { recognizer->add_scalar_type_spec( BF16X2_TYPE ); }
 	| F16_TYPE   { recognizer->add_scalar_type_spec( F16_TYPE ); }
 	| F32_TYPE   { recognizer->add_scalar_type_spec( F32_TYPE ); }
 	| F64_TYPE   { recognizer->add_scalar_type_spec( F64_TYPE ); }
@@ -478,6 +490,10 @@ option: type_spec
 	| rounding_mode
 	| wmma_spec 
 	| prmt_spec 
+	| WARP_OPTION { recognizer->add_option(WARP_OPTION); }
+	| SHIFTAMT_OPTION { recognizer->add_option(SHIFTAMT_OPTION); }
+	| EVICT_FIRST_OPTION { recognizer->add_option(EVICT_FIRST_OPTION); }
+	| EVICT_LAST_OPTION { recognizer->add_option(EVICT_LAST_OPTION); }
 	| SYNC_OPTION { recognizer->add_option(SYNC_OPTION); }
 	| ARRIVE_OPTION { recognizer->add_option(ARRIVE_OPTION); }
 	| RED_OPTION { recognizer->add_option(RED_OPTION); }

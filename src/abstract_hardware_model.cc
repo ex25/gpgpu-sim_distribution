@@ -1216,6 +1216,8 @@ void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
 }
 
 void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
+  const ptx_instruction *pI = static_cast<const ptx_instruction *>(
+      m_gpu->gpgpu_ctx->ptx_fetch_inst(inst.pc));
   for (unsigned t = 0; t < m_warp_size; t++) {
     if (inst.active(t)) {
       if (warpId == (unsigned(-1))) warpId = inst.warp_id();
@@ -1226,6 +1228,10 @@ void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
       checkExecutionStatusAndUpdate(inst, t, tid);
     }
   }
+  // Predicate evaluation above has removed non-executing lanes. Read every
+  // collective input before writing any result, including an in-place shfl.
+  if (pI->is_warp_collective() && inst.active_count())
+    collective_impl(pI, this, inst);
 }
 
 bool core_t::ptx_thread_done(unsigned hw_thread_id) const {

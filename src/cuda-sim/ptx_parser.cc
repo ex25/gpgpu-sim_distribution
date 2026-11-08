@@ -598,12 +598,14 @@ void ptx_recognizer::add_scalar_type_spec(int type_spec) {
     case S16_TYPE:
     case U16_TYPE:
     case F16_TYPE:
+    case BF16_TYPE:
       g_size = 2;
       break;
     case B32_TYPE:
     case S32_TYPE:
     case U32_TYPE:
     case F32_TYPE:
+    case BF16X2_TYPE:
       g_size = 4;
       break;
     case B64_TYPE:
@@ -687,7 +689,12 @@ void ptx_recognizer::add_1vector_operand(const char *d1) {
   PTX_PARSE_DPRINTF("add_1vector_operand");
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   parse_assert(s1 != NULL, "component(s) missing declarations.");
-  g_operands.push_back(operand_info(s1, NULL, NULL, NULL, gpgpu_ctx));
+  // Scalar inline-PTX loads/stores may still wrap their one register in {}.
+  // tex.1d keeps its actual one-component coordinate vector.
+  if (g_opcode == LD_OP || g_opcode == LDU_OP || g_opcode == ST_OP)
+    g_operands.push_back(operand_info(s1, gpgpu_ctx));
+  else
+    g_operands.push_back(operand_info(s1, NULL, NULL, NULL, gpgpu_ctx));
 }
 
 void ptx_recognizer::add_2vector_operand(const char *d1, const char *d2) {

@@ -837,7 +837,8 @@ void ptx_instruction::set_opcode_and_latency() {
       op = LOAD_OP;
       break;
     case BAR_OP:
-      op = BARRIER_OP;
+      m_is_warp_barrier = is_warp_barrier();
+      op = m_is_warp_barrier ? MEMORY_BARRIER_OP : BARRIER_OP;
       break;
     case SST_OP:
       op = BARRIER_OP;
@@ -1018,6 +1019,15 @@ void ptx_instruction::set_opcode_and_latency() {
       initiation_interval = tensor_init;
       op = TENSOR_CORE_OP;
       break;
+    case REDUX_OP:
+      op = SPECIALIZED_UNIT_4_OP;
+      latency = 4;
+      initiation_interval = 1;
+      break;
+    case ELECT_OP:
+      op = SPECIALIZED_UNIT_1_OP;
+      latency = initiation_interval = 4;
+      break;
     case SHFL_OP:
       latency = int_latency[5];
       initiation_interval = int_init[5];
@@ -1120,6 +1130,9 @@ void ptx_instruction::pre_decode() {
       break;
   }
 
+  // bar.warp has a member-mask input, not a destination register.
+  if (is_warp_barrier()) has_dst = false;
+
   switch (m_cache_option) {
     case CA_OPTION:
       cache_op = CACHE_ALL;
@@ -1172,33 +1185,19 @@ void ptx_instruction::pre_decode() {
       } else if (o.is_vector()) {
         is_vectorin = 1;
         unsigned num_elem = o.get_vect_nelem();
-        if (num_elem >= 1) out[0] = o.reg1_num();
-        if (num_elem >= 2) out[1] = o.reg2_num();
-        if (num_elem >= 3) out[2] = o.reg3_num();
-        if (num_elem >= 4) out[3] = o.reg4_num();
-        if (num_elem >= 5) out[4] = o.reg5_num();
-        if (num_elem >= 6) out[5] = o.reg6_num();
-        if (num_elem >= 7) out[6] = o.reg7_num();
-        if (num_elem >= 8) out[7] = o.reg8_num();
-        for (int i = 0; i < num_elem; i++) arch_reg.dst[i] = o.arch_reg_num(i);
+        for (unsigned i = 0; i < num_elem; ++i) {
+          const symbol *reg = o.vec_symbol(i);
+          if (!reg->is_non_arch_reg()) {
+            out[i] = reg->reg_num();
+            arch_reg.dst[i] = reg->arch_reg_num();
+          }
+        }
       }
     } else {
       if (o.is_reg() && !o.is_non_arch_reg()) {
         int reg_num = o.reg_num();
         arch_reg.src[m] = o.arch_reg_num();
-        switch (m) {
-          case 0:
-            in[0] = reg_num;
-            break;
-          case 1:
-            in[1] = reg_num;
-            break;
-          case 2:
-            in[2] = reg_num;
-            break;
-          default:
-            break;
-        }
+        in[m] = reg_num;
         m++;
       } else if (o.is_vector()) {
         // assert(m == 0); //only support 1 vector operand (for textures) right
@@ -1838,7 +1837,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     } else {
       const ptx_instruction *pI_saved = pI;
       ptx_instruction *pJ = NULL;
-      if (pI->get_opcode() == VOTE_OP || pI->get_opcode() == ACTIVEMASK_OP) {
+      if (pI->get_opcode() == ACTIVEMASK_OP) {
         pJ = new ptx_instruction(*pI);
         *((warp_inst_t *)pJ) = inst;  // copy active mask information
         pI = pJ;
@@ -1857,8 +1856,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // Tensorcore is warp synchronous operation. So these instructions needs
       // to be executed only once. To make the simulation faster removing the
       // redundant tensorcore operation
-      if (!tensorcore_op(inst_opcode) ||
-          ((tensorcore_op(inst_opcode)) && (lane_id == 0))) {
+      if (!pI->is_warp_collective() &&
+          (!tensorcore_op(inst_opcode) || lane_id == 0)) {
         switch (inst_opcode) {
 #define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
   case OP:                                         \

@@ -1132,7 +1132,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     }
 
   } else if (next_inst->op == MEMORY_BARRIER_OP) {
-    m_warp[warp_id]->set_membar();
+    m_warp[warp_id]->set_membar(next_inst->is_warp_barrier());
   } else if (next_inst->m_is_ldgdepbar) {  // Add for LDGDEPBAR
     m_warp[warp_id]->m_ldgdepbar_id++;
     // If there are no added LDGSTS, insert an empty vector
@@ -4902,9 +4902,16 @@ bool shader_core_ctx::warp_waiting_at_barrier(unsigned warp_id) const {
 
 bool shader_core_ctx::warp_waiting_at_mem_barrier(unsigned warp_id) {
   if (!m_warp[warp_id]->get_membar()) return false;
+  // Shared stores have no destination register in the scoreboard. Drain their
+  // pipeline, and global store acknowledgments, before releasing bar.warp.
+  if (m_warp[warp_id]->is_warp_mem_barrier() &&
+      (!m_warp[warp_id]->stores_done() ||
+       m_warp[warp_id]->num_issued_inst_in_pipeline() != 0))
+    return true;
   if (!m_scoreboard->pendingWrites(warp_id)) {
     m_warp[warp_id]->clear_membar();
-    if (m_gpu->get_config().flush_l1()) {
+    if (!m_warp[warp_id]->is_warp_mem_barrier() &&
+        m_gpu->get_config().flush_l1()) {
       // Mahmoud fixed this on Nov 2019
       // Invalidate L1 cache
       // Based on Nvidia Doc, at MEM barrier, we have to

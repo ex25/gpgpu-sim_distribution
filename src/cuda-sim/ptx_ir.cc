@@ -1042,6 +1042,14 @@ unsigned type_info_key::type_decode(int type, size_t &size, int &basic_type) {
       size = 64;
       basic_type = 0;
       return 7;
+    case BF16_TYPE:
+      size = 16;
+      basic_type = -1;
+      return 17;
+    case BF16X2_TYPE:
+      size = 32;
+      basic_type = -1;
+      return 18;
     case F16_TYPE:
       size = 16;
       basic_type = -1;
@@ -1249,6 +1257,10 @@ ptx_instruction::ptx_instruction(
   m_vector_spec = 0;
   m_atomic_spec = 0;
   m_membar_level = 0;
+  m_sync = false;
+  m_warp_scope = false;
+  m_shiftamt = false;
+  m_barrier_op = 0;
   m_inst_size = 8;  // bytes
   int rr = 0;
   std::list<int>::const_iterator i;
@@ -1282,7 +1294,20 @@ ptx_instruction::ptx_instruction(
   for (i = options.begin(); i != options.end(); i++, n++) {
     int last_ptx_inst_option = *i;
     switch (last_ptx_inst_option) {
+      case WARP_OPTION:
+        m_warp_scope = true;
+        break;
+      case SHIFTAMT_OPTION:
+        m_shiftamt = true;
+        break;
+      case EVICT_FIRST_OPTION:
+      case EVICT_LAST_OPTION:
+        // Keep the normal cache path; eviction priority is not modeled.
+        break;
       case SYNC_OPTION:
+        m_sync = true;
+        if (m_opcode == BAR_OP) m_barrier_op = SYNC_OPTION;
+        break;
       case ARRIVE_OPTION:
       case RED_OPTION:
         m_barrier_op = last_ptx_inst_option;
@@ -1449,6 +1474,8 @@ ptx_instruction::ptx_instruction(
     }
   }
   m_scalar_type = scalar_type;
+  // elect has an implicit 32-bit lane destination and no type suffix.
+  if (m_opcode == ELECT_OP) m_scalar_type.push_back(B32_TYPE);
   m_space_spec = space_spec;
   if ((opcode == ST_OP || opcode == LD_OP || opcode == LDU_OP) &&
       (space_spec == undefined_space)) {

@@ -1091,6 +1091,13 @@ class ptx_instruction : public warp_inst_t {
   unsigned clamp_mode() const { return m_clamp_mode; }
   unsigned left_mode() const { return m_left_mode; }
   unsigned dimension() const { return m_geom_spec; }
+  bool is_sync() const { return m_sync; }
+  bool is_warp_barrier() const { return m_opcode == BAR_OP && m_warp_scope; }
+  bool is_warp_collective() const {
+    return m_opcode == SHFL_OP || m_opcode == VOTE_OP || m_opcode == REDUX_OP ||
+           m_opcode == ELECT_OP || is_warp_barrier();
+  }
+  bool is_shiftamt() const { return m_shiftamt; }
   unsigned barrier_op() const { return m_barrier_op; }
   unsigned shfl_op() const { return m_shfl_op; }
   unsigned prmt_op() const { return m_prmt_op; }
@@ -1166,6 +1173,9 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_saturation_mode;
   unsigned m_clamp_mode;
   unsigned m_left_mode;
+  bool m_sync;
+  bool m_warp_scope;
+  bool m_shiftamt;
   unsigned m_barrier_op;
   unsigned m_shfl_op;
   unsigned m_prmt_op;

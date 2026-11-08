@@ -1322,6 +1322,7 @@ class inst_t {
     }
     isize = 0;
     m_is_proxy_fence = false;
+    m_is_warp_barrier = false;
     m_syncs_op = SYNCS_MAX_ENUM_NO_USED;
   }
   bool valid() const { return m_decoded; }
@@ -1382,6 +1383,7 @@ class inst_t {
   bool is_tma_load() const { return is_tma() && memory_op == memory_load; }
   bool is_tma_store() const { return is_tma() && memory_op == memory_store; }
   bool is_arrives() const { return (op == ARRIVES_OP); }
+  bool is_warp_barrier() const { return m_is_warp_barrier; }
   bool is_gmma() const { return (op == SPECIALIZED_UNIT_5_OP); }
 
   unsigned get_num_operands() const { return num_operands; }
@@ -1455,6 +1457,7 @@ class inst_t {
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model
   // Right we just support fence.proxy.async.shared::{cta, cluster}
   bool m_is_proxy_fence;
+  bool m_is_warp_barrier;
   fence_proxy_kind m_fence_proxy_kind;
 
   // Weili: syncs unit related, for mbarrier

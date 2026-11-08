@@ -1736,7 +1736,7 @@ void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       thread->get_operand_value(src1, dst, i_type, thread, 1);
   const int msb = (i_type == U32_TYPE || i_type == S32_TYPE) ? 31 : 63;
 
-  unsigned long a = 0;
+  uint64_t a = 0;
   switch (i_type) {
     case S32_TYPE:
       a = src1_data.s32;
@@ -1756,18 +1756,19 @@ void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   // negate negative signed inputs
-  if ((i_type == S32_TYPE || i_type == S64_TYPE) && (a & (1 << msb))) {
+  if ((i_type == S32_TYPE || i_type == S64_TYPE) &&
+      (a & (uint64_t(1) << msb))) {
     a = ~a;
   }
   uint32_t d_data = 0xffffffff;
-  for (uint32_t i = msb; i >= 0; i--) {
-    if (a & (1 << i)) {
+  for (int i = msb; i >= 0; i--) {
+    if (a & (uint64_t(1) << i)) {
       d_data = i;
       break;
     }
   }
 
-  // if (.shiftamt && d != 0xffffffff)  { d = msb - d; }
+  if (pI->is_shiftamt() && d_data != 0xffffffff) d_data = msb - d_data;
 
   // store d
   thread->set_operand_value(dst, d_data, U32_TYPE, thread, pI);
@@ -3054,6 +3055,12 @@ void ptx_saturate(ptx_reg_t &data, int saturation_mode, int type) {
   }
 }
 
+// BF16 is stored as bits, not as the host's FP16 type.
+static uint16_t f32_to_bf16(uint32_t bits) {
+  if ((bits & 0x7fffffff) > 0x7f800000) return 0x7fff;
+  return (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
+}
+
 void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -3062,8 +3069,25 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned rounding_mode = pI->rounding_mode();
   unsigned saturation_mode = pI->saturation_mode();
 
-  //   if ( to_type == F16_TYPE || from_type == F16_TYPE )
-  //      abort();
+  if (to_type == BF16_TYPE || to_type == BF16X2_TYPE ||
+      from_type == BF16_TYPE) {
+    ptx_reg_t a = thread->get_operand_value(src1, dst, from_type, thread, 1);
+    ptx_reg_t result;
+    if (from_type == BF16_TYPE) {
+      assert(to_type == F32_TYPE);
+      result.u32 = uint32_t(a.u16) << 16;
+    } else {
+      assert(from_type == F32_TYPE && rounding_mode == RN_OPTION);
+      result.u32 = f32_to_bf16(a.u32);
+      if (to_type == BF16X2_TYPE) {
+        ptx_reg_t b =
+            thread->get_operand_value(pI->src2(), dst, F32_TYPE, thread, 1);
+        result.u32 = (result.u32 << 16) | f32_to_bf16(b.u32);
+      }
+    }
+    thread->set_operand_value(dst, result, to_type, thread, pI);
+    return;
+  }
 
   int to_sign, from_sign;
   size_t from_width, to_width;
@@ -5379,86 +5403,139 @@ void set_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, pI->get_type(), thread, pI);
 }
 
-void shfl_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
-  unsigned i_type = pI->get_type();
-  int tid;
+// Called once after per-lane predicate evaluation. Keep inputs separate from
+// outputs: a shuffle may overwrite its own source, or even its mask register.
+void collective_impl(const ptx_instruction *p, core_t *core, warp_inst_t w) {
+  unsigned warp =
+      core->get_gpu()->is_functional_sim() ? w.warp_id_func() : w.warp_id();
+  unsigned base = warp * core->get_warp_size();
+  ptx_thread_info **threads = core->get_thread_info();
+  uint32_t active = w.get_warp_active_mask().to_ulong();
+  uint32_t live = 0;
+  for (unsigned lane = 0; lane < core->get_warp_size(); ++lane)
+    if (threads[base + lane] && !threads[base + lane]->is_done())
+      live |= uint32_t(1) << lane;
 
-  if (core->get_gpu()->is_functional_sim())
-    tid = inst.warp_id_func() * core->get_warp_size();
-  else
-    tid = inst.warp_id() * core->get_warp_size();
-
-  ptx_thread_info *thread = core->get_thread_info()[tid];
-  ptx_warp_info *warp_info = thread->m_warp_info;
-  int lane = warp_info->get_done_threads();
-  thread = core->get_thread_info()[tid + lane];
-
-  const operand_info &dst = pI->dst();
-  const operand_info &src1 = pI->src1();
-  const operand_info &src2 = pI->src2();
-  const operand_info &src3 = pI->src3();
-  int bval = (thread->get_operand_value(src2, dst, i_type, thread, 1)).u32;
-  int cval = (thread->get_operand_value(src3, dst, i_type, thread, 1)).u32;
-  int mask = cval >> 8;
-  bval &= 0x1F;
-  cval &= 0x1F;
-
-  int maxLane = (lane & mask) | (cval & ~mask);
-  int minLane = lane & mask;
-
-  int src_idx;
-  unsigned p;
-  switch (pI->shfl_op()) {
-    case UP_OPTION:
-      src_idx = lane - bval;
-      p = (src_idx >= maxLane);
-      break;
-    case DOWN_OPTION:
-      src_idx = lane + bval;
-      p = (src_idx <= maxLane);
-      break;
-    case BFLY_OPTION:
-      src_idx = lane ^ bval;
-      p = (src_idx <= maxLane);
-      break;
-    case IDX_OPTION:
-      src_idx = minLane | (bval & ~mask);
-      p = (src_idx <= maxLane);
-      break;
-    default:
-      printf("GPGPU-Sim PTX: ERROR: Invalid shfl option\n");
-      assert(0);
-      break;
+  uint32_t values[32] = {}, masks[32] = {}, b[32] = {}, c[32] = {};
+  const operand_info &dst = p->dst();
+  int opcode = p->get_opcode();
+  for (unsigned lane = 0; lane < 32; ++lane) {
+    if (!(active & (uint32_t(1) << lane))) continue;
+    ptx_thread_info *thread = threads[base + lane];
+    const auto read = [&](const operand_info &o, unsigned type) {
+      return thread->get_operand_value(o, dst, type, thread, 1);
+    };
+    masks[lane] = active;
+    if (p->is_warp_barrier()) {
+      masks[lane] = read(dst, B32_TYPE).u32;
+    } else if (opcode == SHFL_OP) {
+      values[lane] = read(p->src1(), B32_TYPE).u32;
+      b[lane] = read(p->src2(), B32_TYPE).u32 & 31;
+      c[lane] = read(p->src3(), B32_TYPE).u32;
+      if (p->is_sync()) masks[lane] = read(p->src4(), B32_TYPE).u32;
+    } else if (opcode == VOTE_OP) {
+      values[lane] =
+          !(read(p->src1(), PRED_TYPE).pred & 1) ^ p->src1().is_neg_pred();
+      if (p->is_sync()) masks[lane] = read(p->src2(), B32_TYPE).u32;
+    } else if (opcode == REDUX_OP) {
+      assert(p->get_atomic() == ATOMIC_ADD && p->get_type() == S32_TYPE);
+      values[lane] = read(p->src1(), S32_TYPE).u32;
+      masks[lane] = read(p->src2(), B32_TYPE).u32;
+    } else {
+      assert(opcode == ELECT_OP);
+      masks[lane] = read(p->src1(), B32_TYPE).u32;
+    }
+    // Current consumers arrive in a single dynamic warp instruction. Never
+    // turn a missing participant into successful synchronization.
+    uint32_t members = masks[lane] & live;
+    if ((members & active) != members) {
+      fprintf(stderr,
+              "PTX collective at PC %llu: mask=%08x active=%08x "
+              "requires split arrival support\n",
+              (unsigned long long)w.pc, masks[lane], active);
+      abort();
+    }
+    assert(members & (uint32_t(1) << lane));
   }
-  // copy from own lane
-  if (!p) src_idx = lane;
 
-  // copy input from lane src_idx
-  ptx_reg_t data;
-  if (inst.active(src_idx)) {
-    ptx_thread_info *source = core->get_thread_info()[tid + src_idx];
-    data = source->get_operand_value(src1, dst, i_type, source, 1);
-  } else {
-    printf(
-        "GPGPU-Sim PTX: WARNING: shfl input value unpredictable for inactive "
-        "threads in a warp\n");
-    data.u32 = 0;
-  }
-  thread->set_operand_value(dst, data, i_type, thread, pI);
-
-  /*
-  TODO: deal with predicates appropriately using the following pseudocode:
-  if (!isGuardPredicateTrue(src_idx)) {
-          printf("GPGPU-Sim PTX: WARNING: shfl input value unpredictable for
-  predicated-off threads in a warp\n");
-  }
-  if (dest predicate selected) data.pred = p;
-  */
-
-  // keep track of the number of threads that have executed in the warp
-  warp_info->inc_done_threads();
-  if (warp_info->get_done_threads() == inst.active_count()) {
-    warp_info->reset_done_threads();
+  for (unsigned lane = 0; lane < 32; ++lane) {
+    if (!(active & (uint32_t(1) << lane))) continue;
+    uint32_t members = masks[lane] & live;
+    ptx_thread_info *thread = threads[base + lane];
+    ptx_reg_t result;
+    bool predicate = false;
+    if (p->is_warp_barrier()) continue;  // timing waits in the warp's membar
+    if (opcode == SHFL_OP) {
+      unsigned seg = (c[lane] >> 8) & 31;
+      unsigned lo = lane & seg;
+      unsigned hi = lo | ((c[lane] & 31) & (~seg & 31));
+      int source = lane;
+      switch (p->shfl_op()) {
+        case UP_OPTION:
+          source = int(lane) - b[lane];
+          predicate = source >= int(hi);
+          break;
+        case DOWN_OPTION:
+          source = lane + b[lane];
+          predicate = source <= int(hi);
+          break;
+        case BFLY_OPTION:
+          source = lane ^ b[lane];
+          predicate = source <= int(hi);
+          break;
+        case IDX_OPTION:
+          source = lo | (b[lane] & (~seg & 31));
+          predicate = source <= int(hi);
+          break;
+        default:
+          abort();
+      }
+      if (!predicate) source = lane;
+      assert(members & (uint32_t(1) << source));
+      result.u32 = values[source];
+    } else if (opcode == VOTE_OP) {
+      uint32_t ballot = 0;
+      for (unsigned src = 0; src < 32; ++src)
+        if ((members & (uint32_t(1) << src)) && values[src])
+          ballot |= uint32_t(1) << src;
+      if (p->vote_mode() == ptx_instruction::vote_ballot) {
+        result.u32 = ballot;
+      } else {
+        switch (p->vote_mode()) {
+          case ptx_instruction::vote_any:
+            predicate = ballot != 0;
+            break;
+          case ptx_instruction::vote_all:
+            predicate = ballot == members;
+            break;
+          case ptx_instruction::vote_uni:
+            predicate = ballot == 0 || ballot == members;
+            break;
+          default:
+            abort();
+        }
+        result.pred = predicate ? 0 : 1;
+      }
+    } else if (opcode == REDUX_OP) {
+      result.u32 = 0;
+      for (unsigned src = 0; src < 32; ++src)
+        if (members & (uint32_t(1) << src)) result.u32 += values[src];
+    } else {
+      unsigned leader = 0;
+      while (!(members & (uint32_t(1) << leader))) ++leader;
+      result.u32 = leader;
+      predicate = lane == leader;
+    }
+    if (dst.get_double_operand_type() == -2) {
+      // PTX shfl/elect use data|predicate, unlike PTXPlus predicate|data.
+      thread->set_reg(dst.vec_symbol(0), result);
+      ptx_reg_t pred;
+      pred.pred = predicate ? 0 : 1;
+      thread->set_reg(dst.vec_symbol(1), pred);
+    } else {
+      unsigned type = opcode == ELECT_OP ? B32_TYPE : p->get_type();
+      thread->set_operand_value(dst, result, type, thread, p);
+    }
   }
 }
 
@@ -6438,85 +6515,6 @@ void vsub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
 }
 
-void vote_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  static bool first_in_warp = true;
-  static bool and_all;
-  static bool or_all;
-  static unsigned int ballot_result;
-  static std::list<ptx_thread_info *> threads_in_warp;
-  static unsigned last_tid;
-
-  if (first_in_warp) {
-    first_in_warp = false;
-    threads_in_warp.clear();
-    and_all = true;
-    or_all = false;
-    ballot_result = 0;
-    int offset = 31;
-    while ((offset >= 0) && !pI->active(offset)) offset--;
-    assert(offset >= 0);
-    last_tid =
-        (thread->get_hw_tid() - (thread->get_hw_tid() % pI->warp_size())) +
-        offset;
-  }
-
-  ptx_reg_t src1_data;
-  const operand_info &src1 = pI->src1();
-  src1_data = thread->get_operand_value(src1, pI->dst(), PRED_TYPE, thread, 1);
-
-  // predicate value was changed so the lowest bit being set means the zero flag
-  // is set. As a result, the value of src1_data.pred must be inverted to get
-  // proper behavior
-  bool pred_value = !(src1_data.pred & 0x0001);
-  bool invert = src1.is_neg_pred();
-
-  threads_in_warp.push_back(thread);
-  and_all &= (invert ^ pred_value);
-  or_all |= (invert ^ pred_value);
-
-  // vote.ballot
-  if (invert ^ pred_value) {
-    int lane_id = thread->get_hw_tid() % pI->warp_size();
-    ballot_result |= (1 << lane_id);
-  }
-
-  if (thread->get_hw_tid() == last_tid) {
-    if (pI->vote_mode() == ptx_instruction::vote_ballot) {
-      ptx_reg_t data = ballot_result;
-      for (std::list<ptx_thread_info *>::iterator t = threads_in_warp.begin();
-           t != threads_in_warp.end(); ++t) {
-        const operand_info &dst = pI->dst();
-        (*t)->set_operand_value(dst, data, pI->get_type(), (*t), pI);
-      }
-    } else {
-      bool pred_value = false;
-
-      switch (pI->vote_mode()) {
-        case ptx_instruction::vote_any:
-          pred_value = or_all;
-          break;
-        case ptx_instruction::vote_all:
-          pred_value = and_all;
-          break;
-        case ptx_instruction::vote_uni:
-          pred_value = (or_all ^ and_all);
-          break;
-        default:
-          abort();
-      }
-      ptx_reg_t data;
-      data.pred = pred_value ? 0 : 1;  // the way ptxplus handles the zero flag,
-                                       // 1 = false and 0 = true
-
-      for (std::list<ptx_thread_info *>::iterator t = threads_in_warp.begin();
-           t != threads_in_warp.end(); ++t) {
-        const operand_info &dst = pI->dst();
-        (*t)->set_operand_value(dst, data, PRED_TYPE, (*t), pI);
-      }
-    }
-    first_in_warp = true;
-  }
-}
 
 void activemask_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   active_mask_t l_activemask_bitset = pI->get_warp_active_mask();

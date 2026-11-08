@@ -130,6 +130,7 @@ class shd_warp_t {
     n_completed = m_warp_size;
     m_n_atomic = 0;
     m_membar = false;
+    m_warp_mem_barrier = false;
     m_done_exit = true;
     m_last_fetch = 0;
     m_next = 0;
@@ -255,7 +256,11 @@ class shd_warp_t {
   void inc_n_atomic() { m_n_atomic++; }
   void dec_n_atomic(unsigned n) { m_n_atomic -= n; }
 
-  void set_membar() { m_membar = true; }
+  void set_membar(bool warp_barrier = false) {
+    m_membar = true;
+    m_warp_mem_barrier = warp_barrier;
+  }
+  bool is_warp_mem_barrier() const { return m_warp_mem_barrier; }
   void clear_membar() { m_membar = false; }
   bool get_membar() const { return m_membar; }
   void set_mbarrier_waiting(unsigned lane) {
@@ -457,6 +462,7 @@ class shd_warp_t {
   unsigned m_next;
 
   unsigned m_n_atomic;  // number of outstanding atomic operations
+  bool m_warp_mem_barrier;
   bool m_membar;        // if true, warp is waiting at memory barrier
 
   bool m_done_exit;  // true once thread exit has been registered for threads in
