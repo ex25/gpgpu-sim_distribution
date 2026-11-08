@@ -1072,7 +1072,19 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
-  if (next_inst->m_is_ldgsts) {
+  warp_inst_t &issued = **pipe_reg;
+  if (issued.m_ptx_cp_async_op) {
+    for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+      if (!issued.active(lane)) continue;
+      auto &groups = m_warp[warp_id]->m_ptx_cp_async_groups[lane];
+      if (issued.m_ptx_cp_async_op == PTX_CP_ASYNC_COPY)
+        (*issued.m_ptx_cp_async_copies)[lane].group = groups.add();
+      else if (issued.m_ptx_cp_async_op == PTX_CP_ASYNC_COMMIT)
+        groups.commit();
+      else
+        groups.wait(issued.m_ptx_cp_async_wait);
+    }
+  } else if (next_inst->m_is_ldgsts) {
     if (m_warp[warp_id]->m_ldgdepbar_buf.size() == ldgdepbar_id + 1) {
       m_warp[warp_id]->m_ldgdepbar_buf[ldgdepbar_id].push_back(*next_inst);
     } else {
@@ -2090,6 +2102,15 @@ void ldst_unit::get_L1T_sub_stats(struct cache_sub_stats &css) const {
 
 // Add this function to unset depbar
 void shader_core_ctx::unset_depbar(const warp_inst_t &inst) {
+  if (inst.m_ptx_cp_async_op == PTX_CP_ASYNC_COPY) {
+    for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+      if (!inst.active(lane)) continue;
+      const auto &copy = (*inst.m_ptx_cp_async_copies)[lane];
+      copy.shared->write(copy.dst, 16, copy.data, NULL, NULL);
+      m_warp[inst.warp_id()]->m_ptx_cp_async_groups[lane].complete(copy.group);
+    }
+    return;
+  }
   bool done_flag = true;
   unsigned int end_group = m_warp[inst.warp_id()]->m_depbar_start_id == 0
                                ? m_warp[inst.warp_id()]->m_ldgdepbar_buf.size()
@@ -3582,6 +3603,8 @@ void ldst_unit::cycle() {
             }
           }
         }
+        if (pipe_reg.m_ptx_cp_async_op == PTX_CP_ASYNC_COPY)
+          pending_requests = m_pending_ldgsts[warp_id][pipe_reg.get_uid()] != 0;
         if (!pending_requests) {
           m_core->warp_inst_complete(*m_dispatch_reg);
           m_scoreboard->releaseRegisters(m_dispatch_reg);
@@ -5025,6 +5048,8 @@ bool shd_warp_t::functional_done() const {
 }
 
 bool shd_warp_t::hardware_done() const {
+  for (const auto &groups : m_ptx_cp_async_groups)
+    if (groups.outstanding()) return false;
   return functional_done() && stores_done() && tma_loads_done() &&
          !inst_in_pipeline();
 }
@@ -5045,6 +5070,7 @@ bool shd_warp_t::waiting() {
   waiting |= (m_n_atomic > 0);
   // Waiting for LDGSTS to finish
   waiting |= m_waiting_ldgsts;
+  for (const auto &groups : m_ptx_cp_async_groups) waiting |= groups.waiting();
   // Waiting for TMA store bulk group to finish
   if (m_waiting_tma_bulk_group) {
     // Check if we should still wait for the TMA store bulk group

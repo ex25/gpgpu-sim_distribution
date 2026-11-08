@@ -6675,3 +6675,38 @@ void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread,
 
   return;
 }
+
+// Snapshot read-only gating input at issue; shared becomes visible only at the
+// LSU completion event. One payload is shared by all copies of the warp inst.
+void cp_async_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  if (pI->get_opcode() == CP_ASYNC_WAIT_OP) {
+    inst.m_ptx_cp_async_wait = pI->operand_lookup(0).get_literal_value().u32;
+    return;
+  }
+  if (pI->get_opcode() == CP_ASYNC_COMMIT_OP) return;
+  inst.m_ptx_cp_async_copies =
+      std::make_shared<std::vector<ptx_cp_async_copy> >(MAX_WARP_SIZE);
+  for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
+    if (!inst.active(lane)) continue;
+    ptx_thread_info *thread =
+        core->get_thread_info()[inst.warp_id() * MAX_WARP_SIZE + lane];
+    const operand_info &dst = pI->operand_lookup(0);
+    auto value = [&](unsigned n, unsigned type) {
+      return thread->get_operand_value(pI->operand_lookup(n), dst, type, thread,
+                                       0);
+    };
+    assert(value(2, U32_TYPE).u32 == 16);
+    auto &copy = (*inst.m_ptx_cp_async_copies)[lane];
+    copy.shared = thread->m_shared_mem;
+    copy.dst = value(0, U32_TYPE).u32;
+    copy.lane = lane;
+    copy.source_size = value(3, U32_TYPE).u32;
+    assert(copy.source_size == 0 || copy.source_size == 16);
+    new_addr_type src = value(1, U64_TYPE).u64;
+    if (copy.source_size)
+      thread->get_global_memory()->read(src, copy.source_size, copy.data);
+    inst.set_addr(lane, src);
+  }
+  inst.space = global_space;
+  inst.data_size = 16;
+}

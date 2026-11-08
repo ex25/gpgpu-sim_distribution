@@ -808,6 +808,17 @@ void ptx_instruction::set_opcode_and_latency() {
       if (has_memory_read()) op = LOAD_OP;
       if (has_memory_write()) op = STORE_OP;
       break;
+    case CP_ASYNC_OP:
+      m_ptx_cp_async_op = PTX_CP_ASYNC_COPY;
+      m_is_ldgsts = true;
+      op = LOAD_OP;
+      break;
+    case CP_ASYNC_COMMIT_OP:
+      m_ptx_cp_async_op = PTX_CP_ASYNC_COMMIT;
+      break;
+    case CP_ASYNC_WAIT_OP:
+      m_ptx_cp_async_op = PTX_CP_ASYNC_WAIT;
+      break;
     case LD_OP:
       op = LOAD_OP;
       break;
@@ -1111,6 +1122,11 @@ void ptx_instruction::pre_decode() {
     memory_op = has_memory_read() ? memory_load : memory_store;
   }
 
+  if (m_opcode == CP_ASYNC_OP) {
+    space = global_space;
+    data_size = 16;
+  }
+
   bool has_dst = false;
 
   switch (get_opcode()) {
@@ -1133,6 +1149,7 @@ void ptx_instruction::pre_decode() {
   // bar.warp has a member-mask input, not a destination register.
   if (is_warp_barrier()) has_dst = false;
 
+  if (m_opcode == CP_ASYNC_OP) m_cache_option = CG_OPTION;
   switch (m_cache_option) {
     case CA_OPTION:
       cache_op = CACHE_ALL;
@@ -1194,7 +1211,12 @@ void ptx_instruction::pre_decode() {
         }
       }
     } else {
-      if (o.is_reg() && !o.is_non_arch_reg()) {
+      if (m_opcode == CP_ASYNC_OP && o.is_memory_operand()) {
+        if (o.get_symbol()->type()->get_key().is_reg()) {
+          in[m] = o.reg_num();
+          arch_reg.src[m++] = o.arch_reg_num();
+        }
+      } else if (o.is_reg() && !o.is_non_arch_reg()) {
         int reg_num = o.reg_num();
         arch_reg.src[m] = o.arch_reg_num();
         in[m] = reg_num;
@@ -1236,7 +1258,7 @@ void ptx_instruction::pre_decode() {
   // Get address registers inside memory operands.
   // Assuming only one memory operand per instruction,
   //  and maximum of two address registers for one memory operand.
-  if (has_memory_read() || has_memory_write()) {
+  if (m_opcode != CP_ASYNC_OP && (has_memory_read() || has_memory_write())) {
     ptx_instruction::const_iterator op = op_iter_begin();
     for (; op != op_iter_end(); op++, n++) {  // process operands
       const operand_info &o = *op;
@@ -1856,7 +1878,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // Tensorcore is warp synchronous operation. So these instructions needs
       // to be executed only once. To make the simulation faster removing the
       // redundant tensorcore operation
-      if (!pI->is_warp_collective() &&
+      if (!pI->is_cp_async() && !pI->is_warp_collective() &&
           (!tensorcore_op(inst_opcode) || lane_id == 0)) {
         switch (inst_opcode) {
 #define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
@@ -1917,7 +1939,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     memory_space_t insn_space = undefined_space;
     _memory_op_t insn_memory_op = no_memory_op;
     unsigned insn_data_size = 0;
-    if ((pI->has_memory_read() || pI->has_memory_write())) {
+    if (!pI->is_cp_async() &&
+        (pI->has_memory_read() || pI->has_memory_write())) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         insn_memaddr = last_eaddr();
         insn_space = last_space();
@@ -2028,7 +2051,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
 
     // "Return values"
-    if (!skip) {
+    if (!skip && !pI->is_cp_async()) {
       if (!((inst_opcode == MMA_LD_OP || inst_opcode == MMA_ST_OP))) {
         inst.space = insn_space;
         inst.set_addr(lane_id, insn_memaddr);

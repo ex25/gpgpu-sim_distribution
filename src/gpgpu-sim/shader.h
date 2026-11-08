@@ -54,6 +54,7 @@
 // #include "../cuda-sim/ptx.tab.h"
 
 #include "../abstract_hardware_model.h"
+#include "../cuda-sim/cp_async.h"
 #include "../utils.h"
 #include "addrdec.h"
 #include "delayqueue.h"
@@ -147,6 +148,7 @@ class shd_warp_t {
 
     // Ni: Set waiting to false
     m_waiting_ldgsts = false;
+    for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
 
     // Ni: Clear m_ldgdepbar_buf
     for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
@@ -199,6 +201,7 @@ class shd_warp_t {
 
     // Ni: Set waiting to false
     m_waiting_ldgsts = false;
+    for (auto &groups : m_ptx_cp_async_groups) groups = cp_async_groups();
 
     // Ni: Clear m_ldgdepbar_buf
     for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
@@ -515,6 +518,7 @@ class shd_warp_t {
   // Number of prior groups to wait on a DEPBAR instruction resulted from
   // either: cp.async.bulk.wait_group N or cp.async.wait_group
   unsigned int m_depbar_group;
+  cp_async_groups m_ptx_cp_async_groups[MAX_WARP_SIZE];
   bool m_waiting_ldgsts;  // Ni: Whether the warp is waiting for the LDGSTS
                           // instrs to finish
 

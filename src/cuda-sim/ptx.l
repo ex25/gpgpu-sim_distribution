@@ -87,6 +87,9 @@ wmma\.store 	TC; yylval->int_value = MMA_ST_OP; return OPCODE;
 
 call	TC; BEGIN(NOT_OPCODE); yylval->int_value = CALL_OP; return OPCODE; // blocking opcode token in case the callee has the same name as an opcode
 callp   TC; BEGIN(NOT_OPCODE); yylval->int_value = CALLP_OP; return OPCODE;
+cp\.async\.cg\.shared\.global TC; yylval->int_value = CP_ASYNC_OP; return OPCODE;
+cp\.async\.commit_group TC; yylval->int_value = CP_ASYNC_COMMIT_OP; return OPCODE;
+cp\.async\.wait_group TC; yylval->int_value = CP_ASYNC_WAIT_OP; return OPCODE;
 clz	TC; yylval->int_value = CLZ_OP; return OPCODE;
 cnot	TC; yylval->int_value = CNOT_OP; return OPCODE;
 cos	TC; yylval->int_value = COS_OP; return OPCODE;

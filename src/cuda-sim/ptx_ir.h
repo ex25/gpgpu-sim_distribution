@@ -1093,6 +1093,10 @@ class ptx_instruction : public warp_inst_t {
   unsigned dimension() const { return m_geom_spec; }
   bool is_sync() const { return m_sync; }
   bool is_warp_barrier() const { return m_opcode == BAR_OP && m_warp_scope; }
+  bool is_cp_async() const {
+    return m_opcode == CP_ASYNC_OP || m_opcode == CP_ASYNC_COMMIT_OP ||
+           m_opcode == CP_ASYNC_WAIT_OP;
+  }
   bool is_warp_collective() const {
     return m_opcode == SHFL_OP || m_opcode == VOTE_OP || m_opcode == REDUX_OP ||
            m_opcode == ELECT_OP || is_warp_barrier();
@@ -1108,7 +1112,7 @@ class ptx_instruction : public warp_inst_t {
 
   bool has_memory_read() const {
     if (m_opcode == LD_OP || m_opcode == LDU_OP || m_opcode == TEX_OP ||
-        m_opcode == MMA_LD_OP)
+        m_opcode == MMA_LD_OP || m_opcode == CP_ASYNC_OP)
       return true;
     // Check PTXPlus operand type below
     // Source operands are memory operands

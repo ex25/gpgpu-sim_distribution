@@ -1469,6 +1469,22 @@ enum divergence_support_t { POST_DOMINATOR = 1, NUM_SIMD_MODEL };
 
 const unsigned MAX_ACCESSES_PER_INSN_PER_THREAD = 8;
 
+enum ptx_cp_async_kind {
+  PTX_CP_ASYNC_NONE,
+  PTX_CP_ASYNC_COPY,
+  PTX_CP_ASYNC_COMMIT,
+  PTX_CP_ASYNC_WAIT
+};
+
+struct ptx_cp_async_copy {
+  class memory_space *shared;
+  new_addr_type dst;
+  unsigned lane;
+  unsigned long long group;
+  unsigned source_size;
+  unsigned char data[16];
+};
+
 class warp_inst_t : public inst_t {
   // TODO Weili Oct, 8 2025: Fields unique to certain type of instructions
   // TODO should be grouped under a union to reduce memory usage
@@ -1768,6 +1784,10 @@ class warp_inst_t : public inst_t {
 
   // Ni: add boolean to indicate whether the instruction is ldgsts
   bool m_is_ldgsts;
+  // PTX copy/commit/wait are separate from trace DEPBAR classification.
+  ptx_cp_async_kind m_ptx_cp_async_op = PTX_CP_ASYNC_NONE;
+  unsigned m_ptx_cp_async_wait = 0;
+  std::shared_ptr<std::vector<ptx_cp_async_copy>> m_ptx_cp_async_copies;
   bool m_is_ldgdepbar;
   bool m_is_depbar;
 

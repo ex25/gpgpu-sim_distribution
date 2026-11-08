@@ -1476,6 +1476,7 @@ ptx_instruction::ptx_instruction(
   m_scalar_type = scalar_type;
   // elect has an implicit 32-bit lane destination and no type suffix.
   if (m_opcode == ELECT_OP) m_scalar_type.push_back(B32_TYPE);
+  if (is_cp_async()) m_scalar_type.push_back(B32_TYPE);
   m_space_spec = space_spec;
   if ((opcode == ST_OP || opcode == LD_OP || opcode == LDU_OP) &&
       (space_spec == undefined_space)) {

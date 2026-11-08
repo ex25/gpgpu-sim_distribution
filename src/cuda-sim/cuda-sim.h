@@ -46,6 +46,7 @@ extern const char *g_gpgpusim_version_string;
 extern int g_debug_execution;
 
 extern void print_splash();
+void cp_async_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst);
 void collective_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst);
 
 extern void ptxinfo_opencl_addinfo(

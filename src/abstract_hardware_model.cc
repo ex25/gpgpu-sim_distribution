@@ -527,6 +527,11 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
     for (unsigned thread = subwarp * subwarp_size;
          thread < subwarp_size * (subwarp + 1); thread++) {
       if (!active(thread)) continue;
+      // Zero-source cp.async still writes 16 shared bytes, but reads no global
+      // bytes. Preserve its executing mask for grouping and instruction stats.
+      if (m_ptx_cp_async_op == PTX_CP_ASYNC_COPY &&
+          (*m_ptx_cp_async_copies)[thread].source_size == 0)
+        continue;
 
       unsigned data_size_coales = data_size;
       unsigned num_accesses = 1;
@@ -1232,6 +1237,7 @@ void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
   // collective input before writing any result, including an in-place shfl.
   if (pI->is_warp_collective() && inst.active_count())
     collective_impl(pI, this, inst);
+  if (pI->is_cp_async() && inst.active_count()) cp_async_impl(pI, this, inst);
 }
 
 bool core_t::ptx_thread_done(unsigned hw_thread_id) const {
