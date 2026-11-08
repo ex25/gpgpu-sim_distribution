@@ -52,6 +52,7 @@ class ptx_recognizer;
 %token <int_value>  WMMA_DIRECTIVE
 %token <int_value>  LAYOUT 
 %token <int_value>  CONFIGURATION 
+%token  NORETURN_DIRECTIVE
 %token  ALIGN_DIRECTIVE
 %token  BRANCHTARGETS_DIRECTIVE
 %token  BYTE_DIRECTIVE
@@ -267,9 +268,13 @@ function_decl: function_decl_header LEFT_PAREN { recognizer->start_function($1);
 	| function_decl_header { recognizer->start_function($1); recognizer->add_function_name(""); recognizer->g_func_decl=0; $$ = recognizer->reset_symtab(); }
 	;
 
-function_ident_param: IDENTIFIER { recognizer->add_function_name($1); } LEFT_PAREN {recognizer->func_header_info("(");} param_list RIGHT_PAREN { recognizer->g_func_decl=0; recognizer->func_header_info(")"); }
+function_ident_param: IDENTIFIER { recognizer->add_function_name($1); } LEFT_PAREN {recognizer->func_header_info("(");} param_list RIGHT_PAREN function_suffix { recognizer->g_func_decl=0; recognizer->func_header_info(")"); }
 	| IDENTIFIER { recognizer->add_function_name($1); recognizer->g_func_decl=0; }
 	;
+
+function_suffix: /*empty*/
+        | NORETURN_DIRECTIVE
+        ;
 
 function_decl_header: ENTRY_DIRECTIVE { $$ = 1; recognizer->g_func_decl=1; recognizer->func_header(".entry"); }
 	| VISIBLE_DIRECTIVE ENTRY_DIRECTIVE { $$ = 1; recognizer->g_func_decl=1; recognizer->func_header(".entry"); }

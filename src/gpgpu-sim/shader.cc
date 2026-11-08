@@ -4418,8 +4418,8 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
 
   // Limit by shmem/shader
   unsigned int result_shmem = (unsigned)-1;
-  if (kernel_info->smem > 0)
-    result_shmem = gpgpu_shmem_size / kernel_info->smem;
+  if (k.shared_memory_per_cta() > 0)
+    result_shmem = gpgpu_shmem_size / k.shared_memory_per_cta();
 
   // Limit by register count, rounded up to multiple of 4.
   unsigned int result_regs = (unsigned)-1;
@@ -4436,10 +4436,13 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
   result = gs_min2(result, result_cta);
 
   static const struct gpgpu_ptx_sim_info *last_kinfo = NULL;
-  if (last_kinfo !=
-      kernel_info) {  // Only print out stats if kernel_info struct changes
+  static size_t last_shared_per_cta = (size_t)-1;
+  if (last_kinfo != kernel_info ||
+      last_shared_per_cta != k.shared_memory_per_cta()) {
     last_kinfo = kernel_info;
-    printf("GPGPU-Sim uArch: CTA/core = %u, limited by:", result);
+    last_shared_per_cta = k.shared_memory_per_cta();
+    printf("GPGPU-Sim uArch: CTA/core = %u, shared/CTA = %zu, limited by:",
+           result, last_shared_per_cta);
     if (result == result_thread) printf(" threads");
     if (result == result_shmem) printf(" shmem");
     if (result == result_regs) printf(" regs");
@@ -4471,7 +4474,7 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
   if (adaptive_cache_config && !k.cache_config_set) {
     // For more info about adaptive cache, see
     // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-7-x
-    unsigned total_shmem = kernel_info->smem * result;
+    unsigned total_shmem = k.shared_memory_per_cta() * result;
     assert(total_shmem >= 0 && total_shmem <= shmem_opt_list.back());
 
     // Unified cache config is in KB. Converting to B

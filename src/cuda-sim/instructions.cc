@@ -259,6 +259,17 @@ ptx_reg_t ptx_thread_info::get_reg(const symbol *reg) {
   return regs_iter->second;
 }
 
+// An extern shared array starts after this entry's fixed shared storage.
+// Its module-level symbol is reused by entries with different static sizes.
+addr_t ptx_thread_info::shared_symbol_address(const symbol *sym) const {
+  const type_info_key &key = sym->type()->get_key();
+  if (!key.is_extern()) return sym->get_address();
+  addr_t end = m_func_info->get_symtab()->get_shared_next();
+  int alignment = key.get_alignment_spec();
+  if (alignment == -1) alignment = 1;
+  return (end + alignment - 1) / alignment * alignment;
+}
+
 ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
                                              operand_info dstInfo,
                                              unsigned opType,
@@ -297,7 +308,7 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
         } else if (info.is_const()) {
           result.u64 = sym->get_address() + op.get_addr_offset();
         } else if (op.is_shared()) {
-          result.u64 = op.get_symbol()->get_address() + op.get_addr_offset();
+          result.u64 = shared_symbol_address(op.get_symbol()) + op.get_addr_offset();
         } else if (op.is_sstarr()) {
           result.u64 = op.get_symbol()->get_address() + op.get_addr_offset();
         } else {
@@ -314,7 +325,7 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
       } else if (op.is_label()) {
         result.u64 = op.get_symbol()->get_address();
       } else if (op.is_shared()) {
-        result.u64 = op.get_symbol()->get_address();
+        result.u64 = shared_symbol_address(op.get_symbol());
       } else if (op.is_sstarr()) {
         result.u64 = op.get_symbol()->get_address();
       } else if (op.is_const()) {
@@ -2144,6 +2155,16 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   assert(target.is_function_address());
   const symbol *func_addr = target.get_symbol();
   function_info *target_func = func_addr->get_pc();
+  if (target_func->get_name() == "__assertfail") {
+    dim3 cta = thread->get_ctaid();
+    dim3 tid = thread->get_tid();
+    fprintf(stderr,
+            "GPGPU-Sim PTX: __assertfail at %s:%u, CTA (%u,%u,%u), "
+            "thread (%u,%u,%u)\n",
+            pI->source_file(), pI->source_line(), cta.x, cta.y, cta.z, tid.x,
+            tid.y, tid.z);
+    abort();
+  }
   if (target_func->is_pdom_set()) {
     printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
            target_func->get_name().c_str());
@@ -6381,7 +6402,9 @@ void txq_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
 }
 void trap_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  inst_not_implemented(pI);
+  fprintf(stderr, "GPGPU-Sim PTX: trap at %s:%u\n", pI->source_file(),
+          pI->source_line());
+  abort();
 }
 void vabsdiff_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);

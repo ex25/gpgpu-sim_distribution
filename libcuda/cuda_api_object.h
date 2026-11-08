@@ -151,12 +151,13 @@ class kernel_config {
   void set_arg(const void *arg, size_t size, size_t offset) {
     m_args.push_front(gpgpu_ptx_sim_arg(arg, size, offset));
   }
+  size_t shared_mem() const { return m_sharedMem; }
   dim3 grid_dim() const { return m_GridDim; }
   dim3 block_dim() const { return m_BlockDim; }
   void set_grid_dim(dim3 *d) { m_GridDim = *d; }
   void set_block_dim(dim3 *d) { m_BlockDim = *d; }
   gpgpu_ptx_sim_arg_list_t get_args() { return m_args; }
-  struct CUstream_st *get_stream() { return m_stream; }
+  struct CUstream_st *get_stream() const { return m_stream; }
 
  private:
   dim3 m_GridDim;
@@ -183,6 +184,7 @@ class cuda_runtime_api {
   std::map<unsigned long long, size_t> g_mallocPtr_Size;
   // maps sm version number to set of filenames
   std::map<unsigned, std::set<std::string> > version_filename;
+  std::map<std::string, std::string> filename_target;
   std::map<void *, void **> pinned_memory;  // support for pinned memories added
   std::map<void *, size_t> pinned_memory_size;
   glbmap_entry_t *g_glbmap;

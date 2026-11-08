@@ -848,6 +848,10 @@ kernel_info_t::~kernel_info_t() {
 
 std::string kernel_info_t::name() const { return m_kernel_entry->get_name(); }
 
+size_t kernel_info_t::shared_memory_per_cta() const {
+  return ptx_sim_kernel_info(m_kernel_entry)->smem + m_dynamic_shared_memory;
+}
+
 // Jin: parent and child kernel management for CDP
 void kernel_info_t::set_parent(kernel_info_t *parent, dim3 parent_ctaid,
                                dim3 parent_tid) {

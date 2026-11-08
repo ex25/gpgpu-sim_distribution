@@ -97,6 +97,7 @@ class type_info_key {
   bool is_const() const { return m_space_spec.get_type() == const_space; }
   bool is_tex() const { return m_space_spec == tex_space; }
   bool is_func_addr() const { return m_is_function ? true : false; }
+  bool is_extern() const { return m_extern_spec; }
   int scalar_type() const { return m_scalar_type_spec; }
   int get_alignment_spec() const { return m_alignment_spec; }
   unsigned type_decode(size_t &size, int &t) const;
@@ -1382,6 +1383,17 @@ class function_info {
     return m_param_configs[param_num];
   }
 
+  void set_max_dynamic_shared_memory(size_t bytes) {
+    m_max_dynamic_shared_memory = bytes;
+    m_has_max_dynamic_shared_memory = true;
+  }
+  size_t max_dynamic_shared_memory() const {
+    return m_max_dynamic_shared_memory;
+  }
+  bool has_max_dynamic_shared_memory() const {
+    return m_has_max_dynamic_shared_memory;
+  }
+
   void set_maxnt_id(unsigned maxthreads) { maxnt_id = maxthreads; }
   unsigned get_maxnt_id() { return maxnt_id; }
   // backward pointer
@@ -1393,6 +1405,8 @@ class function_info {
   struct gpgpu_ptx_sim_info m_kernel_info;
 
  private:
+  size_t m_max_dynamic_shared_memory = 0;
+  bool m_has_max_dynamic_shared_memory = false;
   unsigned maxnt_id;
   unsigned m_uid;
   unsigned m_local_mem_framesize;

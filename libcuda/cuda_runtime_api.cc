@@ -1007,6 +1007,20 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
       return g_last_cudaError = cudaErrorInvalidConfiguration;
     }
   }
+  function_info *entry = context->get_kernel(hostFun);
+  size_t shared = config.shared_mem();
+  gpgpu_sim *gpu_model = context->get_device()->get_gpgpu();
+  size_t base = ptx_sim_kernel_info(entry)->smem;
+  size_t limit = entry->max_dynamic_shared_memory();
+  if (!entry->has_max_dynamic_shared_memory()) {
+    size_t per_block = gpu_model->shared_mem_per_block();
+    limit = per_block > base ? per_block - base : 0;
+  }
+  if (shared > limit ||
+      base + shared > gpu_model->getShaderCoreConfig()->gpgpu_shmem_size) {
+    ctx->api->g_cuda_launch_stack.pop_back();
+    return g_last_cudaError = cudaErrorInvalidConfiguration;
+  }
   struct CUstream_st *stream = config.get_stream();
 
   printf("\nGPGPU-Sim PTX: cudaLaunch for 0x%p (mode=%s) on stream %u\n",
@@ -1017,6 +1031,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
   kernel_info_t *grid = ctx->api->gpgpu_cuda_ptx_sim_init_grid(
       hostFun, config.get_args(), config.grid_dim(), config.block_dim(),
       context);
+  grid->set_dynamic_shared_memory(shared);
   // do dynamic PDOM analysis for performance simulation scenario
   std::string kname = grid->name();
   function_info *kernel_func_info = grid->entry();
@@ -2065,16 +2080,13 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
   function_info *entry = context->get_kernel(hostFun);
-#if CUDART_VERSION < 10000
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
-#endif
   for (unsigned i = 0; i < entry->num_args(); i++) {
     std::pair<size_t, unsigned> p = entry->get_param_config(i);
-    cudaSetupArgumentInternal(args[i], p.first, p.second);
+    cudaSetupArgumentInternal(args[i], p.first, p.second, ctx);
   }
 
-  cudaLaunchInternal(hostFun);
-  return g_last_cudaError = cudaSuccess;
+  return cudaLaunchInternal(hostFun, ctx);
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamCreateInternal(
@@ -3333,6 +3345,7 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
       version_filename[version] = std::set<std::string>();
     }
     version_filename[version].insert(line);
+    filename_target[line] = "sm_" + vstr;
   }
 }
 
@@ -3775,11 +3788,13 @@ void cuda_runtime_api::cuobjdumpInit_internal(
   CUctx_st *context = GPGPUSim_Context(gpgpu_ctx);
   ctx_extract_code_func();  // extract all the output of cuobjdump to
                             // _cuobjdump_*.*
+#if CUDART_VERSION < 6000
   const char *pre_load = getenv("CUOBJDUMP_SIM_FILE");
   if (pre_load == NULL || strlen(pre_load) == 0) {
     cuobjdumpSectionList = pruneSectionList(context);
     cuobjdumpSectionList = mergeSections();
   }
+#endif
 }
 
 void cuda_runtime_api::cuobjdumpInit(const char *fn) {
@@ -3851,7 +3866,8 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
     for (itr_s = itr_m->second.begin(); itr_s != itr_m->second.end(); itr_s++) {
       std::string ptx_filename = *itr_s;
       printf("GPGPU-Sim PTX: Loading PTXInfo from %s\n", ptx_filename.c_str());
-      gpgpu_ptx_info_load_from_filename(ptx_filename.c_str(), itr_m->first);
+      gpgpu_ptx_info_load_from_filename(
+          ptx_filename.c_str(), api->filename_target.at(ptx_filename).c_str());
     }
   }
   return;
@@ -3956,6 +3972,14 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(dim3 *gridDim, dim3 *blockDim,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  auto &stack = GPGPU_Context()->api->g_cuda_launch_stack;
+  gpgpusim_ptx_assert(!stack.empty(), "empty launch stack");
+  const kernel_config &config = stack.back();
+  *gridDim = config.grid_dim();
+  *blockDim = config.block_dim();
+  *sharedMem = config.shared_mem();
+  *static_cast<cudaStream_t *>(stream) = config.get_stream();
+  stack.pop_back();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4249,6 +4273,17 @@ cudaError_t CUDARTAPI cudaFuncSetAttribute(const void *func,
                                            int value) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  if (attr == cudaFuncAttributeMaxDynamicSharedMemorySize) {
+    CUctx_st *context = GPGPUSim_Context(GPGPU_Context());
+    function_info *entry = context->get_kernel(static_cast<const char *>(func));
+    size_t base = ptx_sim_kernel_info(entry)->smem;
+    size_t capacity = context->get_device()->get_gpgpu()
+                          ->getShaderCoreConfig()->gpgpu_shmem_size;
+    if (value < 0 || base + value > capacity)
+      return g_last_cudaError = cudaErrorInvalidValue;
+    entry->set_max_dynamic_shared_memory(value);
+    return g_last_cudaError = cudaSuccess;
   }
   printf(
       "GPGPU-Sim PTX: Execution warning: ignoring call to \"%s ( func=%p, "

@@ -547,6 +547,10 @@ class kernel_info_t {
   class function_info *entry() { return m_kernel_entry; }
   const class function_info *entry() const { return m_kernel_entry; }
 
+  void set_dynamic_shared_memory(size_t bytes) { m_dynamic_shared_memory = bytes; }
+  size_t dynamic_shared_memory() const { return m_dynamic_shared_memory; }
+  size_t shared_memory_per_cta() const;
+
   size_t num_blocks() const {
     return m_grid_dim.x * m_grid_dim.y * m_grid_dim.z;
   }
@@ -631,6 +635,7 @@ class kernel_info_t {
   dim3 m_next_cta;
   dim3 m_next_tid;
 
+  size_t m_dynamic_shared_memory = 0;
   unsigned m_num_cores_running;
 
   std::list<class ptx_thread_info *> m_active_threads;

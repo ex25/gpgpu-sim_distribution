@@ -332,6 +332,7 @@ class ptx_thread_info {
       const ptx_reg_t &data3, const ptx_reg_t &data4, const ptx_reg_t &data5,
       const ptx_reg_t &data6, const ptx_reg_t &data7, const ptx_reg_t &data8);
 
+  addr_t shared_symbol_address(const symbol *sym) const;
   function_info *func_info() { return m_func_info; }
   void print_insn(unsigned pc, FILE *fp) const;
   void set_info(function_info *func);

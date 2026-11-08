@@ -361,15 +361,15 @@ char *get_app_binary_name() {
 }
 
 void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
-                                                      unsigned sm_version) {
+                                                      const char *sm_target) {
   std::string ptxas_filename(std::string(filename) + "as");
   char buff[1024], extra_flags[1024];
   extra_flags[0] = 0;
   if (!device_runtime->g_cdp_enabled)
-    checked_snprintf(extra_flags, 1024, "--gpu-name=sm_%u", sm_version);
+    checked_snprintf(extra_flags, 1024, "--gpu-name=%s", sm_target);
   else
-    checked_snprintf(extra_flags, 1024, "--compile-only --gpu-name=sm_%u",
-                     sm_version);
+    checked_snprintf(extra_flags, 1024, "--compile-only --gpu-name=%s",
+                     sm_target);
   checked_snprintf(
       buff, 1024,
       "$CUDA_INSTALL_PATH/bin/ptxas %s -v %s --output-file  /dev/null 2> %s",

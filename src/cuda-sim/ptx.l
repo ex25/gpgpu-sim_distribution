@@ -199,6 +199,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.ecr TC;  return PRMT_ECR_MODE;
 \.rc16 TC; return PRMT_RC16_MODE;
 
+\.noreturn TC; return NORETURN_DIRECTIVE;
 \.align TC; return ALIGN_DIRECTIVE;
 \.branchtargets TC; return BRANCHTARGETS_DIRECTIVE;
 \.byte	TC; return BYTE_DIRECTIVE; /* not in PTX 2.1 */
