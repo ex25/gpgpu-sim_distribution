@@ -1300,27 +1300,13 @@ class opndcoll_rfu_t
     arbiter_t() {
       m_queue = NULL;
       m_allocated_bank = NULL;
-      m_allocator_rr_head = NULL;
-      _inmatch = NULL;
-      _outmatch = NULL;
-      _request = NULL;
-      m_last_cu = 0;
     }
     void init(unsigned num_cu, unsigned num_banks) {
       assert(num_cu > 0);
       assert(num_banks > 0);
-      m_num_collectors = num_cu;
       m_num_banks = num_banks;
-      _inmatch = new int[m_num_banks];
-      _outmatch = new int[m_num_collectors];
-      _request = new int *[m_num_banks];
-      for (unsigned i = 0; i < m_num_banks; i++)
-        _request[i] = new int[m_num_collectors];
       m_queue = new std::list<op_t>[num_banks];
       m_allocated_bank = new allocation_t[num_banks];
-      m_allocator_rr_head = new unsigned[num_cu];
-      for (unsigned n = 0; n < num_cu; n++)
-        m_allocator_rr_head[n] = n % num_banks;
       reset_alloction();
     }
 
@@ -1375,18 +1361,9 @@ class opndcoll_rfu_t
 
    private:
     unsigned m_num_banks;
-    unsigned m_num_collectors;
 
     allocation_t *m_allocated_bank;  // bank # -> register that wins
     std::list<op_t> *m_queue;
-
-    unsigned *
-        m_allocator_rr_head;  // cu # -> next bank to check for request (rr-arb)
-    unsigned m_last_cu;       // first cu to check while arb-ing banks (rr)
-
-    int *_inmatch;
-    int *_outmatch;
-    int **_request;
   };
 
   class collector_unit_t {

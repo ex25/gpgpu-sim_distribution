@@ -33,6 +33,8 @@
 #include "instructions.h"
 #include "half.h"
 #include "half.hpp"
+#include "hopper_math.h"
+#include "nvidia_math.h"
 #include "opcodes.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
@@ -294,8 +296,15 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
         const type_info_key &info = type->get_key();
 
         if (info.is_reg()) {
-          const symbol *name = op.get_symbol();
-          result.u64 = get_reg(name).u64 + op.get_addr_offset();
+          result = get_reg(sym);
+          // A 32-bit address must not include arithmetic carry bits held in
+          // the simulator's wider register storage (e.g. add.s32 r, r, -4).
+          int address_type = info.scalar_type();
+          if (address_type == B32_TYPE || address_type == U32_TYPE ||
+              address_type == S32_TYPE)
+            result.u64 = uint32_t(result.u32 + op.get_addr_offset());
+          else
+            result.u64 += op.get_addr_offset();
         } else if (info.is_param_kernel()) {
           result.u64 = sym->get_address() + op.get_addr_offset();
         } else if (info.is_param_local()) {
@@ -3249,7 +3258,12 @@ void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.f16 = src1_data.f16 / src2_data.f16;
       break;  // assert(0); break;
     case F32_TYPE:
-      data.f32 = src1_data.f32 / src2_data.f32;
+      if (pI->math_mode() == APPROX_OPTION || pI->math_mode() == FULL_OPTION)
+        data.f32 = nvidia_math::divide(src1_data.f32, src2_data.f32,
+                                       pI->math_mode() == FULL_OPTION,
+                                       pI->flush_to_zero());
+      else
+        data.f32 = src1_data.f32 / src2_data.f32;
       break;
     case F64_TYPE:
     case FF64_TYPE:
@@ -3278,7 +3292,7 @@ void ex2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      data.f32 = cuda_math::__powf(2.0, src1_data.f32);
+      data.f32 = nvidia_math::ex2(src1_data.f32, pI->flush_to_zero());
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
@@ -4790,7 +4804,9 @@ void rcp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      data.f32 = 1.0f / src1_data.f32;
+      data.f32 = pI->math_mode() == APPROX_OPTION
+                     ? nvidia_math::rcp(src1_data.f32, pI->flush_to_zero())
+                     : 1.0f / src1_data.f32;
       break;
     case F64_TYPE:
     case FF64_TYPE:
@@ -6838,10 +6854,11 @@ void mbarrier_complete(const warp_inst_t &inst, core_t *core,
         if (DTRACE(PTX_TMA))
           printf(
               "PTX_TMA wait cycle=%llu rank=%u address=%u phase=%u "
-              "success=%u\n",
+              "success=%u uid=%u\n",
               core->get_gpu()->global_cycle(),
               kernel.cluster_rank(thread->get_ctaid()), address,
-              unsigned(barrier->get_phase()), unsigned(!result.pred));
+              unsigned(barrier->get_phase()), unsigned(!result.pred),
+              inst.get_uid());
         thread->set_operand_value(p->dst(), result, PRED_TYPE, thread, p);
         break;
       }
@@ -7031,14 +7048,12 @@ static unsigned matrix_address(uint64_t d, unsigned row, unsigned k) {
 }
 
 void ptx_matrix_op::compute() {
-  float a[64][16], b[128][16];
+  uint16_t a[64][16], b[128][16];
   auto *mem = warps[0]->threads[0]->m_shared_mem;
   auto read = [&](uint64_t desc, unsigned r, unsigned k) {
-    ptx_reg_t v;
     uint16_t bits;
     mem->read(matrix_address(desc, r, k), 2, &bits);
-    v.u32 = unsigned(bits) << 16;
-    return v.f32;
+    return bits;
   };
   for (unsigned m = 0; m < 64; ++m)
     for (unsigned k = 0; k < 16; ++k) a[m][k] = read(warps[0]->a, m, k);
@@ -7053,8 +7068,7 @@ void ptx_matrix_op::compute() {
       if (warps[w]->scale)
         sum = source[j] ? source[j]->result[t * 64 + source_index[j]]
                         : warps[w]->initial[l * 64 + j];
-      for (unsigned k = 0; k < 16; ++k) sum = fmaf(a[m][k], b[n][k], sum);
-      result[t * 64 + j] = sum;
+      result[t * 64 + j] = hopper_bf16_block(a[m], b[n], sum);
     }
   }
   for (auto &previous : source) previous.reset();

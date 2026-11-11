@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
 #include <ctime>
@@ -551,7 +552,8 @@ class kernel_info_t {
   kernel_info_t(
       dim3 gridDim, dim3 blockDim, class function_info *entry,
       std::map<std::string, const struct cudaArray *> nameToCudaArray,
-      std::map<std::string, const struct textureInfo *> nameToTextureInfo);
+      std::map<std::string, const struct textureInfo *> nameToTextureInfo,
+      unsigned long long streamID = 0);
   virtual ~kernel_info_t();
 
   void inc_running() { m_num_cores_running++; }
@@ -667,6 +669,7 @@ class kernel_info_t {
   }
   unsigned get_uid() const { return m_uid; }
   unsigned long long get_streamID() const { return m_streamID; }
+  void set_streamID(unsigned long long streamID) { m_streamID = streamID; }
   std::string get_name() const { return name(); }
   std::string name() const;
 
@@ -765,6 +768,10 @@ class kernel_info_t {
   unsigned long long launch_cycle;
   unsigned long long start_cycle;
   unsigned long long end_cycle;
+  bool device_started = false;
+  unsigned long long device_start_cycle = 0;
+  double device_start_wall = 0;
+  unsigned long long ptx_wgmma_count = 0;
   unsigned m_launch_latency;
 
   mutable bool cache_config_set;
@@ -1700,8 +1707,9 @@ class warp_inst_t : public inst_t {
       m_per_scalar_thread.resize(m_config->warp_size);
       m_per_scalar_thread_valid = true;
     }
-    assert(m_per_scalar_thread[n].memreqaddr.empty());
-    m_per_scalar_thread[n].memreqaddr.push_back(addr);
+    assert(m_per_scalar_thread[n].memreqaddr_count == 0);
+    m_per_scalar_thread[n].memreqaddr[0] = addr;
+    m_per_scalar_thread[n].memreqaddr_count = 1;
   }
   void set_cuda_cta_id(dim3 cta_id) { m_cuda_cta_id = cta_id; }
   dim3 get_cuda_cta_id() const { return m_cuda_cta_id; }
@@ -1721,9 +1729,8 @@ class warp_inst_t : public inst_t {
       m_per_scalar_thread_valid = true;
     }
     assert(num_addrs <= MAX_ACCESSES_PER_INSN_PER_THREAD);
-    m_per_scalar_thread[n].memreqaddr.clear();
-    for (unsigned i = 0; i < num_addrs; i++)
-      m_per_scalar_thread[n].memreqaddr.push_back(addr[i]);
+    std::copy_n(addr, num_addrs, m_per_scalar_thread[n].memreqaddr.begin());
+    m_per_scalar_thread[n].memreqaddr_count = num_addrs;
   }
   void set_tma_access_addrs(new_addr_type *addrs, unsigned num_addrs) {
     for (unsigned i = 0; i < num_addrs; i++)
@@ -1824,7 +1831,7 @@ class warp_inst_t : public inst_t {
   }
   new_addr_type get_addr(unsigned n) const {
     assert(m_per_scalar_thread_valid);
-    assert(!m_per_scalar_thread[n].memreqaddr.empty());
+    assert(m_per_scalar_thread[n].memreqaddr_count);
     return m_per_scalar_thread[n].memreqaddr[0];
   }
 
@@ -1905,9 +1912,10 @@ class warp_inst_t : public inst_t {
 
   struct per_thread_info {
     dram_callback_t callback;
-    std::vector<new_addr_type> memreqaddr;  // effective address,
-                                            // dynamic size (up to
-                                            // MAX_ACCESSES_PER_INSN_PER_THREAD)
+    // The bound is already enforced by set_addr. Keep addresses inline so
+    // passing an instruction through the pipeline does not allocate per lane.
+    std::array<new_addr_type, MAX_ACCESSES_PER_INSN_PER_THREAD> memreqaddr{};
+    unsigned memreqaddr_count = 0;
   };
   bool m_per_scalar_thread_valid;
   std::vector<per_thread_info> m_per_scalar_thread;

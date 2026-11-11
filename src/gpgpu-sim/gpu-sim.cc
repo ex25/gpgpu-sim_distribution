@@ -993,6 +993,22 @@ void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
     }
   }
   assert(k != m_running_kernels.end());
+  if (kernel->device_started) {
+    timespec wall;
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    dim3 grid = kernel->get_grid_dim(), block = kernel->get_cta_dim();
+    dim3 cluster = kernel->cluster_dim();
+    printf(
+        "SIM_KERNEL uid=%u entry=%s start=%llu end=%llu core_MHz=%.6f "
+        "grid=%u,%u,%u block=%u,%u,%u cluster=%u,%u,%u shared=%zu "
+        "wgmma=%llu wall_start=%.6f wall_end=%.6f\n",
+        uid, kernel->name().c_str(), kernel->device_start_cycle,
+        kernel->end_cycle, m_config.get_core_freq() / 1e6, grid.x, grid.y,
+        grid.z, block.x, block.y, block.z, cluster.x, cluster.y, cluster.z,
+        kernel->shared_memory_per_cta(), kernel->ptx_wgmma_count,
+        kernel->device_start_wall, wall.tv_sec + wall.tv_nsec / 1e9);
+    fflush(stdout);
+  }
 }
 
 void gpgpu_sim::stop_all_running_kernels() {
@@ -2068,6 +2084,14 @@ unsigned exec_shader_core_ctx::sim_init_thread(
 
 void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   m_last_cta_issue_cycle = m_gpu->global_cycle();
+  // Measure device execution after launch delay, from the first admitted CTA.
+  if (!kernel.device_started) {
+    kernel.device_started = true;
+    kernel.device_start_cycle = m_gpu->global_cycle();
+    timespec wall;
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    kernel.device_start_wall = wall.tv_sec + wall.tv_nsec / 1e9;
+  }
   if (!m_config->gpgpu_concurrent_kernel_sm)
     set_max_cta(kernel);
   else

@@ -1037,7 +1037,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
          stream ? stream->get_uid() : 0);
   kernel_info_t *grid = ctx->api->gpgpu_cuda_ptx_sim_init_grid(
       hostFun, config.get_args(), config.grid_dim(), config.block_dim(),
-      context);
+      context, stream ? stream->get_uid() : 0);
   grid->set_dynamic_shared_memory(shared);
   grid->set_driver_shared_memory(driver_shared);
   grid->set_cluster_dim(config.cluster_dim);
@@ -4491,7 +4491,7 @@ int cuda_runtime_api::load_constants(symbol_table *symtab, addr_t min_gaddr,
 
 kernel_info_t *cuda_runtime_api::gpgpu_cuda_ptx_sim_init_grid(
     const char *hostFun, gpgpu_ptx_sim_arg_list_t args, struct dim3 gridDim,
-    struct dim3 blockDim, CUctx_st *context) {
+    struct dim3 blockDim, CUctx_st *context, unsigned long long streamID) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4503,7 +4503,7 @@ kernel_info_t *cuda_runtime_api::gpgpu_cuda_ptx_sim_init_grid(
   */
   kernel_info_t *result =
       new kernel_info_t(gridDim, blockDim, entry, gpu->getNameArrayMapping(),
-                        gpu->getNameInfoMapping());
+                        gpu->getNameInfoMapping(), streamID);
   if (entry == NULL) {
     printf(
         "GPGPU-Sim PTX: ERROR launching kernel -- no PTX implementation found "

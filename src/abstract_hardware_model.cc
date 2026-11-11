@@ -346,7 +346,7 @@ void warp_inst_t::generate_mem_accesses() {
         for (unsigned thread = subwarp * subwarp_size;
              thread < (subwarp + 1) * subwarp_size; thread++) {
           if (!active(thread)) continue;
-          assert(!m_per_scalar_thread[thread].memreqaddr.empty());
+          assert(m_per_scalar_thread[thread].memreqaddr_count);
           unsigned requests =
               m_ptx_matrix == PTX_LDMATRIX || m_ptx_matrix == PTX_STMATRIX ? 4
                                                                            : 1;
@@ -470,7 +470,7 @@ void warp_inst_t::generate_mem_accesses() {
     std::map<new_addr_type, active_mask_t>::iterator a;
     for (unsigned thread = 0; thread < m_config->warp_size; thread++) {
       if (!active(thread)) continue;
-      assert(!m_per_scalar_thread[thread].memreqaddr.empty());
+      assert(m_per_scalar_thread[thread].memreqaddr_count);
       new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
       new_addr_type block_address =
           line_size_based_tag_func(addr, cache_block_size);
@@ -555,19 +555,20 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
       assert(num_accesses <= MAX_ACCESSES_PER_INSN_PER_THREAD);
 
       //            for(unsigned access=0; access<num_accesses; access++) {
-      // Build addresses from either m_per_scalar_thread[thread].memreqaddr or
-      // m_tma_access_addrs
-      std::vector<new_addr_type> addresses;
+      // Read the stored addresses without copying a temporary vector per lane.
+      const new_addr_type *addresses;
+      unsigned address_count;
       if (is_tma()) {
-        addresses = m_tma_access_addrs;
+        addresses = m_tma_access_addrs.data();
+        address_count = m_tma_access_addrs.size();
       } else {
-        assert(m_per_scalar_thread[thread].memreqaddr.size() <=
-               MAX_ACCESSES_PER_INSN_PER_THREAD);
-        addresses = m_per_scalar_thread[thread].memreqaddr;
+        addresses = m_per_scalar_thread[thread].memreqaddr.data();
+        address_count = m_per_scalar_thread[thread].memreqaddr_count;
       }
 
       // Iterate over addresses for coalescing
-      for (auto &addr : addresses) {
+      for (unsigned access = 0; access < address_count; ++access) {
+        new_addr_type addr = addresses[access];
         new_addr_type block_address =
             line_size_based_tag_func(addr, segment_size);
         unsigned chunk =
@@ -664,7 +665,7 @@ void warp_inst_t::memory_coalescing_arch_atomic(bool is_write,
          thread < subwarp_size * (subwarp + 1); thread++) {
       if (!active(thread)) continue;
 
-      assert(!m_per_scalar_thread[thread].memreqaddr.empty());
+      assert(m_per_scalar_thread[thread].memreqaddr_count);
       new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
       new_addr_type block_address =
           line_size_based_tag_func(addr, segment_size);
@@ -824,29 +825,9 @@ kernels should use the texture bindings seen at the time of launch and textures
 kernel_info_t::kernel_info_t(
     dim3 gridDim, dim3 blockDim, class function_info *entry,
     std::map<std::string, const struct cudaArray *> nameToCudaArray,
-    std::map<std::string, const struct textureInfo *> nameToTextureInfo) {
-  m_kernel_entry = entry;
-  m_grid_dim = gridDim;
-  m_block_dim = blockDim;
-  m_next_cta.x = 0;
-  m_next_cta.y = 0;
-  m_next_cta.z = 0;
-  m_next_tid = m_next_cta;
-  m_num_cores_running = 0;
-  m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
-  m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
-
-  // Jin: parent and child kernel management for CDP
-  m_parent_kernel = NULL;
-
-  // Jin: launch latency management
-  m_launch_latency = entry->gpgpu_ctx->device_runtime->g_kernel_launch_latency;
-
-  m_kernel_TB_latency =
-      entry->gpgpu_ctx->device_runtime->g_kernel_launch_latency +
-      num_blocks() * entry->gpgpu_ctx->device_runtime->g_TB_launch_latency;
-
-  cache_config_set = false;
+    std::map<std::string, const struct textureInfo *> nameToTextureInfo,
+    unsigned long long streamID)
+    : kernel_info_t(gridDim, blockDim, entry, streamID) {
   m_NameToCudaArray = nameToCudaArray;
   m_NameToTextureInfo = nameToTextureInfo;
 }

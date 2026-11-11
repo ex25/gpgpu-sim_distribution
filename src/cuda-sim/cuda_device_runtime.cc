@@ -223,6 +223,7 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
       }
 
       device_launch_op.stream = child_stream;
+      device_grid->set_streamID(child_stream->get_uid());
     }
   }
 

@@ -317,10 +317,9 @@ type_info *symbol_table::get_array_type(type_info *base_type,
 }
 
 void symbol_table::set_label_address(const symbol *label, unsigned addr) {
-  std::map<std::string, symbol *>::iterator i = m_symbols.find(label->name());
-  assert(i != m_symbols.end());
-  symbol *s = i->second;
-  s->set_label_address(addr);
+  // Inline PTX blocks can reuse label names. The operand already identifies
+  // the symbol in its declaring scope, which need not be this function scope.
+  const_cast<symbol *>(label)->set_label_address(addr);
 }
 
 void symbol_table::dump() {
@@ -369,6 +368,7 @@ void function_info::create_basic_blocks() {
         case RET_OP:
         case EXIT_OP:
         case RETP_OP:
+        case TRAP_OP:
         case BREAK_OP:
           i++;
           if (i != m_instructions.end()) leaders.push_back(*i);
@@ -535,11 +535,14 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
     if ((*bb_itr)->is_exit)  // reached last basic block, no successors to link
       continue;
     if (pI->get_opcode() == RETP_OP || pI->get_opcode() == RET_OP ||
-        pI->get_opcode() == EXIT_OP) {
+        pI->get_opcode() == EXIT_OP || pI->get_opcode() == TRAP_OP) {
+      // A trap terminates this path; it must not fall through past the
+      // function.
       (*bb_itr)->successor_ids.insert(exit_bb->bb_id);
       exit_bb->predecessor_ids.insert((*bb_itr)->bb_id);
       if (pI->has_pred()) {
-        printf("GPGPU-Sim PTX: Warning detected predicated return/exit.\n");
+        printf(
+            "GPGPU-Sim PTX: Warning detected predicated return/exit/trap.\n");
         // if predicated, add link to next block
         unsigned next_addr = pI->get_m_instr_mem_index() + pI->inst_size();
         if (next_addr < m_instr_mem_size && m_instr_mem[next_addr]) {
@@ -552,7 +555,7 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
     } else if (pI->get_opcode() == BRA_OP) {
       // find successor and link that basic_block to this one
       operand_info &target = pI->dst();  // get operand, e.g. target name
-      unsigned addr = labels[target.name()];
+      unsigned addr = labels[target.get_symbol()];
       ptx_instruction *target_pI = m_instr_mem[addr];
       basic_block_t *target_bb = target_pI->get_bb();
       (*bb_itr)->successor_ids.insert(target_bb->bb_id);
@@ -601,7 +604,7 @@ bool function_info::connect_break_targets()  // connecting break instructions
       // find successor and link that basic_block to this one
       // successor of a break is set by an preceeding breakaddr instruction
       operand_info *target = find_break_target(pI);
-      unsigned addr = labels[target->name()];
+      unsigned addr = labels[target->get_symbol()];
       ptx_instruction *target_pI = m_instr_mem[addr];
       basic_block_t *target_bb = target_pI->get_bb();
       p_bb->successor_ids.insert(target_bb->bb_id);
@@ -1249,6 +1252,8 @@ ptx_instruction::ptx_instruction(
   m_to_option = false;
   m_cache_option = 0;
   m_rounding_mode = RN_OPTION;
+  m_math_mode = 0;
+  m_flush_to_zero = false;
   m_compare_op = -1;
   m_saturation_mode = 0;
   m_clamp_mode = 0;
@@ -1402,8 +1407,8 @@ ptx_instruction::ptx_instruction(
         m_atomic_spec = last_ptx_inst_option;
         break;
       case APPROX_OPTION:
-        break;
       case FULL_OPTION:
+        m_math_mode = last_ptx_inst_option;
         break;
       case ANY_OPTION:
         m_vote_mode = vote_any;
@@ -1424,6 +1429,7 @@ ptx_instruction::ptx_instruction(
         m_membar_level = SYS_OPTION;
         break;
       case FTZ_OPTION:
+        m_flush_to_zero = true;
         break;
       case EXIT_OPTION:
         m_exit = true;

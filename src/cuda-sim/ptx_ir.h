@@ -1088,6 +1088,8 @@ class ptx_instruction : public warp_inst_t {
   bool is_to() const { return m_to_option; }
   unsigned cache_option() const { return m_cache_option; }
   unsigned rounding_mode() const { return m_rounding_mode; }
+  unsigned math_mode() const { return m_math_mode; }
+  bool flush_to_zero() const { return m_flush_to_zero; }
   unsigned saturation_mode() const { return m_saturation_mode; }
   unsigned clamp_mode() const { return m_clamp_mode; }
   unsigned left_mode() const { return m_left_mode; }
@@ -1182,6 +1184,8 @@ class ptx_instruction : public warp_inst_t {
   int m_wmma_layout[2];
   int m_wmma_configuration;
   unsigned m_rounding_mode;
+  unsigned m_math_mode;
+  bool m_flush_to_zero;
   unsigned m_compare_op;
   unsigned m_saturation_mode;
   unsigned m_clamp_mode;
@@ -1428,6 +1432,8 @@ class function_info {
   struct gpgpu_ptx_sim_info m_kernel_info;
 
  private:
+  void eliminate_register_copies();
+  void coalesce_shared_loads();
   size_t m_max_dynamic_shared_memory = 0;
   bool m_has_max_dynamic_shared_memory = false;
   unsigned maxnt_id;
@@ -1449,7 +1455,7 @@ class function_info {
   std::list<ptx_instruction *> m_instructions;
   std::vector<basic_block_t *> m_basic_blocks;
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
-  std::map<std::string, unsigned> labels;
+  std::map<const symbol *, unsigned> labels;
   unsigned num_reconvergence_pairs;
 
   // Registers/shmem/etc. used (from ptxas -v), loaded from ___.ptxinfo along

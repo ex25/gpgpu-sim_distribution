@@ -935,6 +935,13 @@ void shader_core_ctx::decode() {
           m_stats->m_num_FPdecoded_insn[m_sid]++;
         }
       }
+    } else {
+      // A branch at the end of a function can speculatively fetch past it.
+      // Let the scheduler flush this fetch and recover the PC from the SIMT
+      // stack, just as it does for a wrong-path instruction.
+      auto *warp = m_warp[m_inst_fetch_buffer.m_warp_id];
+      warp->ibuffer_fill(0, nullptr);
+      warp->inc_inst_in_pipeline();
     }
     m_inst_fetch_buffer.m_valid = false;
   }
@@ -1069,6 +1076,34 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
+  const auto &ptx_inst = **pipe_reg;
+  if (DTRACE(PTX_TMA) && m_thread[warp_id * m_config->warp_size] &&
+      (ptx_inst.m_ptx_tensor_op || ptx_inst.m_ptx_matrix ||
+       ptx_inst.m_ptx_mbarrier ||
+       (ptx_inst.space.get_type() == shared_space && ptx_inst.is_store()))) {
+    auto *thread = m_thread[warp_id * m_config->warp_size];
+    const auto &kernel = thread->get_kernel();
+    const dim3 id = thread->get_ctaid();
+    const dim3 cluster = kernel.cluster_id(id);
+    const bool shared_store =
+        ptx_inst.space.get_type() == shared_space && ptx_inst.is_store();
+    new_addr_type address = 0;
+    if (shared_store && ptx_inst.active_count()) {
+      unsigned lane = 0;
+      while (!ptx_inst.active(lane)) ++lane;
+      address = ptx_inst.get_addr(lane);
+    }
+    printf(
+        "PTX_CONTEXT uid=%u kernel=%u sm=%u cta=%u,%u,%u "
+        "cluster=%u,%u,%u rank=%u warp=%u pc=%llu cycle=%llu "
+        "tensor=%u matrix=%u mbarrier=%u shared_store=%u address=%llu\n",
+        ptx_inst.get_uid(), kernel.get_uid(), m_sid, id.x, id.y, id.z,
+        cluster.x, cluster.y, cluster.z, kernel.cluster_rank(id), warp_id,
+        (unsigned long long)ptx_inst.pc, m_gpu->global_cycle(),
+        unsigned(ptx_inst.m_ptx_tensor_op), unsigned(ptx_inst.m_ptx_matrix),
+        unsigned(ptx_inst.m_ptx_mbarrier), unsigned(shared_store),
+        (unsigned long long)address);
+  }
   if ((*pipe_reg)->m_ptx_mbarrier && (*pipe_reg)->active_count())
     m_warp[warp_id]->m_ptx_mbarrier_pending = true;
 
@@ -1114,14 +1149,15 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       auto &t = *tensor_inst.m_ptx_tensor;
       t.pending = tensor_inst.accessq_count();
       t.write_pending = t.pending;
-      DPRINTF(PTX_TMA,
-              "PTX_TMA issue uid=%u kind=%u requests=%u bytes=%zu oob=%zu "
-              "targets=%zu descriptor=%llx base=%llx\n",
-              tensor_inst.get_uid(), unsigned(kind), t.pending, t.data.size(),
-              tensor_inst.get_tma_oob_byte_count(), t.targets.size(),
-              t.descriptor, (unsigned long long)t.map.get<uint64_t>(0));
       if (kind == PTX_TENSOR_STORE)
         t.group = warp.m_ptx_bulk_groups[t.lane].add();
+      DPRINTF(PTX_TMA,
+              "PTX_TMA issue uid=%u kind=%u requests=%u bytes=%zu oob=%zu "
+              "targets=%zu descriptor=%llx base=%llx shared=%u group=%llu\n",
+              tensor_inst.get_uid(), unsigned(kind), t.pending, t.data.size(),
+              tensor_inst.get_tma_oob_byte_count(), t.targets.size(),
+              t.descriptor, (unsigned long long)t.map.get<uint64_t>(0),
+              t.shared_base, t.group);
       if (kind == PTX_TENSOR_PUBLISH)
         t.kernel->ptx_tensor_publications[t.descriptor] += t.pending;
     } else {
@@ -4739,84 +4775,14 @@ void shader_core_ctx::cache_invalidate() { m_ldst_unit->invalidate(); }
 
 // modifiers
 std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads() {
-  std::list<op_t>
-      result;  // a list of registers that (a) are in different register banks,
-               // (b) do not go to the same operand collector
-
-  int input;
-  int output;
-  int _inputs = m_num_banks;
-  int _outputs = m_num_collectors;
-  int _square = (_inputs > _outputs) ? _inputs : _outputs;
-  assert(_square > 0);
-  int _pri = (int)m_last_cu;
-
-  // Clear matching
-  for (int i = 0; i < _inputs; ++i) _inmatch[i] = -1;
-  for (int j = 0; j < _outputs; ++j) _outmatch[j] = -1;
-
-  for (unsigned i = 0; i < m_num_banks; i++) {
-    for (unsigned j = 0; j < m_num_collectors; j++) {
-      assert(i < (unsigned)_inputs);
-      assert(j < (unsigned)_outputs);
-      _request[i][j] = 0;
-    }
-    if (!m_queue[i].empty()) {
-      const op_t &op = m_queue[i].front();
-      int oc_id = op.get_oc_id();
-      assert(i < (unsigned)_inputs);
-      assert(oc_id < _outputs);
-      _request[i][oc_id] = 1;
-    }
-    if (m_allocated_bank[i].is_write()) {
-      assert(i < (unsigned)_inputs);
-      _inmatch[i] = 0;  // write gets priority
-    }
-  }
-
-  ///// wavefront allocator from booksim... --->
-
-  // Loop through diagonals of request matrix
-  // printf("####\n");
-
-  for (int p = 0; p < _square; ++p) {
-    output = (_pri + p) % _outputs;
-
-    // Step through the current diagonal
-    for (input = 0; input < _inputs; ++input) {
-      assert(input < _inputs);
-      assert(output < _outputs);
-      if ((output < _outputs) && (_inmatch[input] == -1) &&
-          //( _outmatch[output] == -1 ) &&   //allow OC to read multiple reg
-          // banks at the same cycle
-          (_request[input][output] /*.label != -1*/)) {
-        // Grant!
-        _inmatch[input] = output;
-        _outmatch[output] = input;
-        // printf("Register File: granting bank %d to OC %d, schedid %d, warpid
-        // %d, Regid %d\n", input, output, (m_queue[input].front()).get_sid(),
-        // (m_queue[input].front()).get_wid(),
-        // (m_queue[input].front()).get_reg());
-      }
-
-      output = (output + 1) % _outputs;
-    }
-  }
-
-  // Round-robin the priority diagonal
-  _pri = (_pri + 1) % _outputs;
-
-  /// <--- end code from booksim
-
-  m_last_cu = _pri;
-  for (unsigned i = 0; i < m_num_banks; i++) {
-    if (_inmatch[i] != -1) {
-      if (!m_allocated_bank[i].is_write()) {
-        unsigned bank = (unsigned)i;
-        op_t &op = m_queue[bank].front();
-        result.push_back(op);
-        m_queue[bank].pop_front();
-      }
+  std::list<op_t> result;
+  // Each bank presents only its FIFO head, and collectors may read several
+  // banks in one cycle. Thus there is no output conflict to arbitrate: the
+  // former wavefront scan granted every nonempty bank without a write.
+  for (unsigned bank = 0; bank < m_num_banks; ++bank) {
+    if (!m_allocated_bank[bank].is_write() && !m_queue[bank].empty()) {
+      result.push_back(m_queue[bank].front());
+      m_queue[bank].pop_front();
     }
   }
 
@@ -6255,10 +6221,12 @@ void ldst_unit::service_ptx_tensor() {
       target.barrier->complete_on(t.data.size());
       if (DTRACE(PTX_TMA))
         printf(
-            "PTX_TMA delivered cycle=%llu uid=%u rank=%u phase=%u bytes=%zu\n",
+            "PTX_TMA delivered cycle=%llu uid=%u rank=%u phase=%u bytes=%zu "
+            "barrier=%u\n",
             (unsigned long long)now, inst.get_uid(),
             target.barrier->get_cluster_cta_identifier().cluster_rank,
-            unsigned(target.barrier->get_phase()), t.data.size());
+            unsigned(target.barrier->get_phase()), t.data.size(),
+            target.barrier->get_bar_offset());
       // pending responses are already zero; use the target marker to retire
       // only after all destinations have received data, even when rank0 exits.
       target.shared = nullptr;
@@ -6311,12 +6279,19 @@ bool shader_core_ctx::prepare_ptx_matrix(const warp_inst_t &inst) {
     op.read_ready =
         m_ldst_unit->reserve_ptx_matrix_shared(64 * 16 * 2 + 128 * 16 * 2);
     if (DTRACE(PTX_TMA))
-      printf("PTX_GMMA read cycle=%llu seq=%u ready=%llu math=262144\n",
-             m_gpu->global_cycle(), inst.m_ptx_matrix_sequence,
-             (unsigned long long)op.read_ready);
+      printf(
+          "PTX_GMMA read cycle=%llu seq=%u ready=%llu math=262144 "
+          "uid=%u a=%llx b=%llx\n",
+          m_gpu->global_cycle(), inst.m_ptx_matrix_sequence,
+          (unsigned long long)op.read_ready, inst.get_uid(),
+          (unsigned long long)op.warps[0]->a,
+          (unsigned long long)op.warps[0]->b);
   }
   if (m_gpu->global_cycle() < op.read_ready) return false;
-  if (!op.computed) op.compute();
+  if (!op.computed) {
+    op.compute();
+    ++m_thread[inst.warp_id() * 32]->get_kernel().ptx_wgmma_count;
+  }
   return true;
 }
 

@@ -56,6 +56,8 @@ typedef void *yyscan_t;
 #include "ptx_parser.h"
 #include "ptx_sim.h"
 
+#include <iterator>
+
 int g_debug_execution = 0;
 // Output debug information to file options
 
@@ -280,9 +282,288 @@ void gpgpu_t::gpgpu_ptx_sim_unbindTexture(
 
 #define MAX_INST_SIZE 8 /*bytes*/
 
+void function_info::eliminate_register_copies() {
+  // PTX virtual registers need not correspond to distinct hardware registers.
+  // Retarget a scalar ALU result when its only read is an adjacent bit copy.
+  // Count every reference, including addresses and vectors, so neither another
+  // definition nor a use on a different control-flow path can be lost.
+  std::map<const symbol *, unsigned> references;
+  if (m_return_var_sym) ++references[m_return_var_sym];
+  for (auto inst : m_instructions) {
+    // Calls can access return parameters; PTXPlus also has coupled operands.
+    // Neither is covered by this scalar-register pass.
+    if (inst->get_opcode() == CALL_OP || inst->get_opcode() == CALLP_OP) return;
+    if (inst->has_pred()) ++references[inst->m_pred];
+    for (const auto &op : inst->m_operands) {
+      if (op.get_double_operand_type()) return;
+      if (op.is_vector()) {
+        for (unsigned n = 0; n < op.get_vect_nelem(); ++n)
+          ++references[op.vec_symbol(n)];
+      } else if ((op.get_type() == reg_t || op.get_type() == symbolic_t ||
+                  op.get_type() == address_t || op.is_memory_operand()) &&
+                 !op.is_immediate_address() && op.get_symbol()->is_reg()) {
+        ++references[op.get_symbol()];
+      }
+    }
+  }
+  auto plain_register = [](const operand_info &op) {
+    return op.is_reg() && !op.is_non_arch_reg() && !op.get_operand_lohi() &&
+           !op.get_operand_neg() && !op.get_double_operand_type();
+  };
+  auto word_type = [](int type) {
+    return type == B32_TYPE || type == U32_TYPE || type == S32_TYPE ||
+           type == F32_TYPE;
+  };
+  unsigned removed = 0;
+  for (auto it = m_instructions.begin(); it != m_instructions.end();) {
+    ptx_instruction *producer = *it;
+    bool scalar_alu = false;
+    switch (producer->get_opcode()) {
+#define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION)                     \
+  case OP:                                                             \
+    scalar_alu = DST && (CLASSIFICATION == 1 || CLASSIFICATION == 2 || \
+                         CLASSIFICATION == 4);                         \
+    break;
+#define OP_W_DEF(OP, FUNC, STR, DST, CLASSIFICATION)
+#include "opcodes.def"
+#undef OP_W_DEF
+#undef OP_DEF
+      default:
+        break;
+    }
+    auto next = std::next(it);
+    if (!scalar_alu || producer->has_pred() ||
+        producer->get_scalar_type().empty() ||
+        !word_type(producer->get_type()) || !producer->get_num_operands() ||
+        !plain_register(producer->dst()) || next == m_instructions.end()) {
+      ++it;
+      continue;
+    }
+    ptx_instruction *copy = *next;
+    const symbol *temporary = producer->dst().get_symbol();
+    if (copy->get_opcode() != MOV_OP || copy->has_pred() ||
+        copy->get_type() != B32_TYPE || !copy->get_options().empty() ||
+        copy->get_num_operands() != 2 || !plain_register(copy->dst()) ||
+        !plain_register(copy->src1()) ||
+        copy->src1().get_symbol() != temporary || references[temporary] != 2 ||
+        !word_type(temporary->type()->get_key().scalar_type()) ||
+        !word_type(copy->dst().get_symbol()->type()->get_key().scalar_type())) {
+      ++it;
+      continue;
+    }
+    const std::string &name = temporary->name();
+    size_t pos = producer->m_source.find(name);
+    if (pos != std::string::npos)
+      producer->m_source.replace(pos, name.size(), copy->dst().name());
+    producer->m_operands[0] = copy->dst();
+    references[temporary] = 0;
+    delete copy;
+    m_instructions.erase(next);
+    ++removed;
+  }
+  if (removed)
+    printf("GPGPU-Sim PTX: eliminated %u single-use register copies in '%s'\n",
+           removed, m_name.c_str());
+}
+
+void function_info::coalesce_shared_loads() {
+  // ptxas combines adjacent words into LDS.128. Charging each scalar PTX
+  // load separately exaggerates bank serialization, notably for strided
+  // shared layouts. Do the same lowering before assigning PCs and decoding.
+  // Prove low zero bits from *all* definitions, including loop-carried ones.
+  // Start at unknown, so a register cycle cannot prove its own alignment.
+  // Only the integer address operations below contribute information.
+  std::map<const symbol *, unsigned> zero_bits;
+  auto trailing_zeros = [](unsigned long long value) {
+    unsigned n = 0;
+    while (n < 4 && !(value & (1ull << n))) ++n;
+    return n;
+  };
+  auto operand_zero_bits = [&](const operand_info &op) -> unsigned {
+    if (op.get_operand_lohi() || op.get_double_operand_type() ||
+        op.get_operand_neg())
+      return 0;
+    if (op.is_literal()) return trailing_zeros(op.get_literal_value().u32);
+    if (op.is_reg()) {
+      auto found = zero_bits.find(op.get_symbol());
+      return found == zero_bits.end() ? 0 : found->second;
+    }
+    if (op.is_shared()) {
+      int alignment = op.get_symbol()->type()->get_key().get_alignment_spec();
+      return alignment > 0 ? trailing_zeros(alignment) : 0;
+    }
+    return 0;
+  };
+  bool changed;
+  do {
+    std::map<const symbol *, unsigned> next;
+    for (auto inst : m_instructions) {
+      // Calls may write through return parameters; keep the existing v4-only
+      // proof for such functions instead of inferring register alignment.
+      if (inst->get_opcode() == CALL_OP || inst->get_opcode() == CALLP_OP) {
+        zero_bits.clear();
+        next.clear();
+        break;
+      }
+      bool writes = false;
+      switch (inst->get_opcode()) {
+#define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
+  case OP:                                         \
+    writes = DST;                                  \
+    break;
+#define OP_W_DEF OP_DEF
+#include "opcodes.def"
+#undef OP_W_DEF
+#undef OP_DEF
+        default:
+          break;
+      }
+      if (!writes || !inst->get_num_operands()) continue;
+      const operand_info &dst = inst->dst();
+      if (!dst.is_reg() && !dst.is_vector()) continue;
+      unsigned bits = 0;
+      int type = inst->get_scalar_type().empty() ? -1 : inst->get_type();
+      if (dst.is_reg() && inst->get_options().empty() &&
+          (type == B32_TYPE || type == U32_TYPE || type == S32_TYPE)) {
+        if (inst->get_opcode() == MOV_OP) {
+          bits = operand_zero_bits(inst->src1());
+        } else if (inst->get_opcode() == ADD_OP) {
+          bits = std::min(operand_zero_bits(inst->src1()),
+                          operand_zero_bits(inst->src2()));
+        } else if (inst->get_opcode() == AND_OP) {
+          bits = std::max(operand_zero_bits(inst->src1()),
+                          operand_zero_bits(inst->src2()));
+        } else if (inst->get_opcode() == SHL_OP && inst->src2().is_literal()) {
+          bits = std::min(
+              4u, operand_zero_bits(inst->src1()) +
+                      std::min(32u, inst->src2().get_literal_value().u32));
+        }
+      }
+      unsigned count = dst.is_vector() ? dst.get_vect_nelem() : 1;
+      for (unsigned n = 0; n < count; ++n) {
+        const symbol *reg =
+            dst.is_vector() ? dst.vec_symbol(n) : dst.get_symbol();
+        auto found = next.find(reg);
+        if (found == next.end())
+          next[reg] = bits;
+        else
+          found->second = std::min(found->second, bits);
+      }
+    }
+    changed = next != zero_bits;
+    zero_bits.swap(next);
+  } while (changed);
+
+  auto eligible = [](const ptx_instruction *inst) {
+    if (inst->get_opcode() != LD_OP || inst->has_pred() ||
+        inst->get_space() != shared_space)
+      return false;
+    int type = inst->get_type();
+    if (type != F32_TYPE && type != B32_TYPE && type != U32_TYPE &&
+        type != S32_TYPE)
+      return false;
+    for (int option : inst->get_options())
+      if (option != V2_TYPE && option != V4_TYPE) return false;
+    const operand_info &address = inst->src1();
+    return address.is_memory_operand() && !address.is_immediate_address() &&
+           address.get_double_operand_type() == 0 &&
+           address.get_symbol()->is_reg() && address.get_addr_offset() >= 0;
+  };
+
+  typedef std::list<ptx_instruction *>::iterator instruction_iterator;
+  struct load_group {
+    const symbol *registers[4] = {};
+    std::vector<instruction_iterator> instructions;
+  };
+  unsigned removed = 0;
+  auto begin = m_instructions.begin();
+  while (begin != m_instructions.end()) {
+    if (!eligible(*begin)) {
+      ++begin;
+      continue;
+    }
+    const symbol *base = (*begin)->src1().get_symbol();
+    int type = (*begin)->get_type();
+    auto end = begin;
+    std::map<int, load_group> groups;
+    std::set<const symbol *> destinations;
+    bool aligned = zero_bits[base] >= 4, independent = true;
+    // Only an uninterrupted run of ordinary reads can be reordered. An
+    // existing v4 read also proves the base is aligned for valid PTX.
+    for (; end != m_instructions.end() && eligible(*end) &&
+           (*end)->src1().get_symbol() == base && (*end)->get_type() == type;
+         ++end) {
+      ptx_instruction *inst = *end;
+      int offset = inst->src1().get_addr_offset();
+      const operand_info &dst = inst->dst();
+      unsigned count = dst.is_vector() ? dst.get_vect_nelem() : 1;
+      unsigned slot = (offset % 16) / 4;
+      if (offset % 4 || slot + count > 4) {
+        independent = false;
+        continue;
+      }
+      if (count == 4 && offset % 16 == 0) aligned = true;
+      load_group &group = groups[offset - offset % 16];
+      group.instructions.push_back(end);
+      for (unsigned q = 0; q < count; ++q) {
+        const symbol *reg =
+            dst.is_vector() ? dst.vec_symbol(q) : dst.get_symbol();
+        if (reg == base || !destinations.insert(reg).second ||
+            group.registers[slot + q])
+          independent = false;
+        group.registers[slot + q] = reg;
+      }
+    }
+    if (aligned && independent) {
+      for (auto &entry : groups) {
+        load_group &group = entry.second;
+        if (group.instructions.size() < 2 || !group.registers[0] ||
+            !group.registers[1] || !group.registers[2] || !group.registers[3])
+          continue;
+        ptx_instruction *first = *group.instructions.front();
+        first->m_operands[0] =
+            operand_info(group.registers[0], group.registers[1],
+                         group.registers[2], group.registers[3], gpgpu_ctx);
+        operand_info address(base, entry.first, gpgpu_ctx);
+        address.make_memory_operand();
+        first->m_operands[1] = address;
+        first->m_vector_spec = V4_TYPE;
+        first->m_options.clear();
+        first->m_options.push_back(V4_TYPE);
+        const char *suffix = type == F32_TYPE   ? "f32"
+                             : type == B32_TYPE ? "b32"
+                             : type == U32_TYPE ? "u32"
+                                                : "s32";
+        std::ostringstream source;
+        source << "ld.shared.v4." << suffix << " {";
+        for (unsigned q = 0; q < 4; ++q) {
+          if (q) source << ", ";
+          source << group.registers[q]->name();
+        }
+        source << "}, [" << base->name() << "+" << entry.first << "];";
+        first->m_source = source.str();
+        for (unsigned q = 1; q < group.instructions.size(); ++q) {
+          delete *group.instructions[q];
+          m_instructions.erase(group.instructions[q]);
+          ++removed;
+        }
+      }
+    }
+    begin = end;
+  }
+  if (removed)
+    printf("GPGPU-Sim PTX: coalesced %u shared loads in '%s'\n", removed,
+           m_name.c_str());
+}
+
 void function_info::ptx_assemble() {
   if (m_assembled) {
     return;
+  }
+
+  if (get_sm_target() == 90) {
+    eliminate_register_copies();
+    coalesce_shared_loads();
   }
 
   // get the instructions into instruction memory...
@@ -313,7 +594,7 @@ void function_info::ptx_assemble() {
     ptx_instruction *pI = *i;
     if (pI->is_label()) {
       const symbol *l = pI->get_label();
-      labels[l->name()] = n;
+      labels[l] = n;
     } else {
       gpgpu_ctx->func_sim->g_pc_to_finfo[PC] = this;
       m_instr_mem[n] = pI;
@@ -337,14 +618,14 @@ void function_info::ptx_assemble() {
     if (pI->get_opcode() == BRA_OP || pI->get_opcode() == BREAKADDR_OP ||
         pI->get_opcode() == CALLP_OP) {
       operand_info &target = pI->dst();  // get operand, e.g. target name
-      if (labels.find(target.name()) == labels.end()) {
+      if (labels.find(target.get_symbol()) == labels.end()) {
         printf(
             "GPGPU-Sim PTX: Loader error (%s:%u): Branch label \"%s\" does not "
             "appear in assembly code.",
             pI->source_file(), pI->source_line(), target.name().c_str());
         abort();
       }
-      unsigned index = labels[target.name()];  // determine address from name
+      unsigned index = labels[target.get_symbol()];
       unsigned PC = m_instr_mem[index]->get_PC();
       m_symtab->set_label_address(target.get_symbol(), PC);
       target.set_type(label_t);

@@ -47,11 +47,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #define LINEBUF_SIZE (4*1024)
 #define TC recognizer->col+=strlen(yytext);
-#define CHECK_UNSIGNED \
-	if( yytext[strlen(yytext)-1]=='U' ) { \
-		printf("GPGPU-Sim: ERROR ** U modifier not implemented\n"); \
-		abort(); \
-	}
 #define YY_DECL int ptx_lex \
 	       (YYSTYPE * yylval_param , yyscan_t yyscanner, ptx_recognizer* recognizer)
 int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
@@ -304,14 +299,14 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 [0-9]+\.[0-9]+ 	 TC; sscanf(yytext,"%lf", &yylval->double_value); return DOUBLE_OPERAND;
 	
-0[xX][0-9a-fA-F]+U? TC; CHECK_UNSIGNED; {
+0[xX][0-9a-fA-F]+U? TC; {
   unsigned long long value = strtoull(yytext, nullptr, 16);
   if (value > 0xffffffffULL) { yylval->int64_value = value; return INT64_OPERAND; }
   yylval->int_value = value; return INT_OPERAND;
 }
 0[0-7]+U?   	TC; printf("GPGPU-Sim: ERROR ** parsing octal not (yet) implemented\n"); abort(); return INT_OPERAND;
 0[bB][01]+U?  	TC; printf("GPGPU-Sim: ERROR ** parsing binary not (yet) implemented\n"); abort(); return INT_OPERAND;
-[-]?[0-9]+U?    TC; CHECK_UNSIGNED; {
+[-]?[0-9]+U?    TC; {
   long long value = yytext[0] == '-' ? strtoll(yytext, nullptr, 10) :
                                     (long long)strtoull(yytext, nullptr, 10);
   if (value < -2147483648LL || value > 2147483647LL) {
