@@ -475,6 +475,30 @@ void function_info::coalesce_shared_loads() {
     const symbol *registers[4] = {};
     std::vector<instruction_iterator> instructions;
   };
+  auto make_vector_load = [&](ptx_instruction *first, const symbol *base,
+                              int offset, int type,
+                              const symbol *const(&registers)[4]) {
+    first->m_operands[0] = operand_info(registers[0], registers[1],
+                                        registers[2], registers[3], gpgpu_ctx);
+    operand_info address(base, offset, gpgpu_ctx);
+    address.make_memory_operand();
+    first->m_operands[1] = address;
+    first->m_vector_spec = V4_TYPE;
+    first->m_options.clear();
+    first->m_options.push_back(V4_TYPE);
+    const char *suffix = type == F32_TYPE   ? "f32"
+                         : type == B32_TYPE ? "b32"
+                         : type == U32_TYPE ? "u32"
+                                            : "s32";
+    std::ostringstream source;
+    source << "ld.shared.v4." << suffix << " {";
+    for (unsigned q = 0; q < 4; ++q) {
+      if (q) source << ", ";
+      source << registers[q]->name();
+    }
+    source << "}, [" << base->name() << "+" << offset << "];";
+    first->m_source = source.str();
+  };
   unsigned removed = 0;
   auto begin = m_instructions.begin();
   while (begin != m_instructions.end()) {
@@ -520,28 +544,8 @@ void function_info::coalesce_shared_loads() {
         if (group.instructions.size() < 2 || !group.registers[0] ||
             !group.registers[1] || !group.registers[2] || !group.registers[3])
           continue;
-        ptx_instruction *first = *group.instructions.front();
-        first->m_operands[0] =
-            operand_info(group.registers[0], group.registers[1],
-                         group.registers[2], group.registers[3], gpgpu_ctx);
-        operand_info address(base, entry.first, gpgpu_ctx);
-        address.make_memory_operand();
-        first->m_operands[1] = address;
-        first->m_vector_spec = V4_TYPE;
-        first->m_options.clear();
-        first->m_options.push_back(V4_TYPE);
-        const char *suffix = type == F32_TYPE   ? "f32"
-                             : type == B32_TYPE ? "b32"
-                             : type == U32_TYPE ? "u32"
-                                                : "s32";
-        std::ostringstream source;
-        source << "ld.shared.v4." << suffix << " {";
-        for (unsigned q = 0; q < 4; ++q) {
-          if (q) source << ", ";
-          source << group.registers[q]->name();
-        }
-        source << "}, [" << base->name() << "+" << entry.first << "];";
-        first->m_source = source.str();
+        make_vector_load(*group.instructions.front(), base, entry.first, type,
+                         group.registers);
         for (unsigned q = 1; q < group.instructions.size(); ++q) {
           delete *group.instructions[q];
           m_instructions.erase(group.instructions[q]);
@@ -551,6 +555,149 @@ void function_info::coalesce_shared_loads() {
     }
     begin = end;
   }
+  auto mentions = [](const ptx_instruction *inst, const symbol *reg) {
+    if (inst->has_pred() && inst->m_pred == reg) return true;
+    for (const operand_info &op : inst->m_operands) {
+      if (op.is_vector()) {
+        for (unsigned n = 0; n < op.get_vect_nelem(); ++n)
+          if (op.vec_symbol(n) == reg) return true;
+      } else if ((op.is_reg() || op.get_type() == symbolic_t ||
+                  op.get_type() == address_t || op.is_memory_operand()) &&
+                 !op.is_immediate_address() && op.get_symbol()->is_reg() &&
+                 op.get_symbol() == reg) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto writes = [&](const ptx_instruction *inst, const symbol *reg) {
+    if (!inst->get_num_operands()) return false;
+    const operand_info &dst = inst->dst();
+    if (dst.is_vector()) {
+      for (unsigned n = 0; n < dst.get_vect_nelem(); ++n)
+        if (dst.vec_symbol(n) == reg) return true;
+      return false;
+    }
+    return dst.is_reg() && dst.get_symbol() == reg;
+  };
+  // Some scalar words form a vector only after intervening independent
+  // arithmetic. Move those reads to the first word's position, but never
+  // change a register value observed before its original load.
+  for (auto first = m_instructions.begin(); first != m_instructions.end();
+       ++first) {
+    ptx_instruction *anchor = *first;
+    if (!eligible(anchor) || anchor->get_vector()) continue;
+    const symbol *base = anchor->src1().get_symbol();
+    if (zero_bits[base] < 4) continue;
+    int type = anchor->get_type();
+    int offset = anchor->src1().get_addr_offset();
+    if (offset % 4) continue;
+    int vector_offset = offset - offset % 16;
+    const symbol *registers[4] = {};
+    std::map<unsigned, instruction_iterator> slots;
+    unsigned first_slot = (offset % 16) / 4;
+    registers[first_slot] = anchor->dst().get_symbol();
+    slots[first_slot] = first;
+    bool safe = registers[first_slot] != base;
+    for (auto next = std::next(first); safe && next != m_instructions.end();
+         ++next) {
+      ptx_instruction *inst = *next;
+      bool shared_read = eligible(inst);
+      bool arithmetic = !inst->has_pred() && (inst->get_opcode() == FMA_OP ||
+                                              inst->get_opcode() == ADD_OP);
+      if (!shared_read && !arithmetic) break;
+      if (writes(inst, base)) break;
+      if (shared_read && inst->get_vector() == 0 &&
+          inst->src1().get_symbol() == base && inst->get_type() == type) {
+        int candidate_offset = inst->src1().get_addr_offset();
+        if (candidate_offset >= vector_offset &&
+            candidate_offset < vector_offset + 16) {
+          unsigned slot = (candidate_offset - vector_offset) / 4;
+          const symbol *reg = inst->dst().get_symbol();
+          if (candidate_offset % 4 || slots.count(slot) || reg == base) break;
+          for (const symbol *seen : registers)
+            if (seen == reg) safe = false;
+          if (!safe) break;
+          registers[slot] = reg;
+          slots[slot] = next;
+        }
+      }
+      if (slots.size() != 4) continue;
+      for (unsigned slot = 0; slot < 4 && safe; ++slot) {
+        if (slots[slot] == first) continue;
+        for (auto between = std::next(first); between != slots[slot];
+             ++between) {
+          if (between != slots[0] && between != slots[1] &&
+              between != slots[2] && between != slots[3] &&
+              mentions(*between, registers[slot])) {
+            safe = false;
+            break;
+          }
+        }
+      }
+      if (safe) {
+        make_vector_load(anchor, base, vector_offset, type, registers);
+        for (unsigned slot = 0; slot < 4; ++slot) {
+          if (slots[slot] == first) continue;
+          delete *slots[slot];
+          m_instructions.erase(slots[slot]);
+          ++removed;
+        }
+      }
+      break;
+    }
+  }
+  // A vector shared read followed immediately by unpack/conversion cannot
+  // hide its load-use latency. Issue the next independent vector read before
+  // that first use, while keeping the preceding read and all arithmetic in
+  // order. This is the one-read lookahead visible in the native BF16 path.
+  auto unpack = [](const ptx_instruction *inst) {
+    return !inst->has_pred() &&
+           (inst->get_opcode() == MOV_OP || inst->get_opcode() == CVT_OP);
+  };
+  unsigned scheduled = 0;
+  for (auto current = m_instructions.begin(); current != m_instructions.end();
+       ++current) {
+    ptx_instruction *load = *current;
+    if (!eligible(load) || load->get_vector() != V4_TYPE) continue;
+    const operand_info &dst = load->dst();
+    if (!dst.is_vector()) continue;
+    auto uses_load = [&](const ptx_instruction *inst) {
+      for (unsigned n = 0; n < dst.get_vect_nelem(); ++n)
+        if (mentions(inst, dst.vec_symbol(n))) return true;
+      return false;
+    };
+    auto first_use = std::next(current);
+    for (; first_use != m_instructions.end() && unpack(*first_use); ++first_use)
+      if (uses_load(*first_use)) break;
+    if (first_use == m_instructions.end() || !unpack(*first_use) ||
+        !uses_load(*first_use))
+      continue;
+    auto next_load = first_use;
+    for (; next_load != m_instructions.end() && unpack(*next_load);
+         ++next_load) {
+    }
+    if (next_load == m_instructions.end() || !eligible(*next_load) ||
+        (*next_load)->get_vector() != V4_TYPE ||
+        !(*next_load)->dst().is_vector())
+      continue;
+    const symbol *base = (*next_load)->src1().get_symbol();
+    const operand_info &next_dst = (*next_load)->dst();
+    bool independent = true;
+    for (auto between = first_use; between != next_load && independent;
+         ++between) {
+      if (writes(*between, base)) independent = false;
+      for (unsigned n = 0; n < next_dst.get_vect_nelem(); ++n)
+        if (mentions(*between, next_dst.vec_symbol(n))) independent = false;
+    }
+    if (independent) {
+      m_instructions.splice(first_use, m_instructions, next_load);
+      ++scheduled;
+    }
+  }
+  if (scheduled)
+    printf("GPGPU-Sim PTX: scheduled %u shared vector reads in '%s'\n",
+           scheduled, m_name.c_str());
   if (removed)
     printf("GPGPU-Sim PTX: coalesced %u shared loads in '%s'\n", removed,
            m_name.c_str());
@@ -890,6 +1037,10 @@ void ptx_instruction::set_fp_or_int_archop() {
 
 void ptx_instruction::set_mul_div_or_other_archop() {
   sp_op = OTHER_OP;
+  if (m_opcode == SHFL_OP) {
+    sp_op = SHFL__OP;
+    return;
+  }
   if (is_tensor_ptx()) return;
   if (m_opcode == ISSPACEP_OP || m_opcode == CLUSTER_ARRIVE_OP ||
       m_opcode == CLUSTER_WAIT_OP || m_opcode == MBARRIER_FENCE_OP)
@@ -1545,6 +1696,12 @@ void ptx_instruction::pre_decode() {
   } else if (has_memory_read() || has_memory_write()) {
     unsigned to_type = get_type();
     data_size = datatype2size(to_type);
+    if (space.get_type() == global_space &&
+        (m_opcode == LD_OP || m_opcode == LDU_OP || m_opcode == ST_OP)) {
+      if (m_vector_spec == V2_TYPE) data_size *= 2;
+      if (m_vector_spec == V3_TYPE) data_size *= 3;
+      if (m_vector_spec == V4_TYPE) data_size *= 4;
+    }
     memory_op = has_memory_read() ? memory_load : memory_store;
   }
 
@@ -2381,6 +2538,17 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
         insn_space = last_space();
         unsigned to_type = pI->get_type();
         insn_data_size = datatype2size(to_type);
+        if (insn_space == shared_space ||
+            (insn_space == global_space &&
+             (inst_opcode == LD_OP || inst_opcode == LDU_OP ||
+              inst_opcode == ST_OP))) {
+          if (pI->get_vector() == V2_TYPE)
+            insn_data_size *= 2;
+          else if (pI->get_vector() == V3_TYPE)
+            insn_data_size *= 3;
+          else if (pI->get_vector() == V4_TYPE)
+            insn_data_size *= 4;
+        }
         insn_memory_op = pI->has_memory_read() ? memory_load : memory_store;
       }
     }

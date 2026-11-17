@@ -253,40 +253,36 @@ void memory_partition_unit::simple_dram_model_cycle() {
     if (m_dram_latency_queue.empty()) break;
     if (((m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle) >=
          m_dram_latency_queue.front().ready_cycle)) {
-      mem_fetch *mf_return = m_dram_latency_queue.front().req;
-      if (mf_return->get_access_type() != L1_WRBK_ACC &&
-          mf_return->get_access_type() != L2_WRBK_ACC) {
-        mf_return->set_reply();
+      dram_delay_t &front = m_dram_latency_queue.front();
+      mem_fetch *mf_return = front.req;
+      bool writeback = mf_return->get_access_type() == L1_WRBK_ACC ||
+                       mf_return->get_access_type() == L2_WRBK_ACC;
+      int dest_spid = -1;
+      if (!writeback) {
         unsigned dest_global_spid = mf_return->get_sub_partition_id();
-        int dest_spid = global_sub_partition_id_to_local_id(dest_global_spid);
+        dest_spid = global_sub_partition_id_to_local_id(dest_global_spid);
         assert(m_sub_partition[dest_spid]->get_id() == dest_global_spid);
-        if (!m_sub_partition[dest_spid]->dram_L2_queue_full()) {
-          // Update stats for simple dram when request is actually dequeued
-          m_stats->memlatstat_dram_access(mf_return);
-          if (mf_return->get_access_type() == L1_WRBK_ACC) {
-            m_sub_partition[dest_spid]->set_done(mf_return);
-            delete mf_return;
-          } else {
-            m_sub_partition[dest_spid]->dram_L2_queue_push(mf_return);
-            mf_return->set_status(
-                IN_PARTITION_DRAM_TO_L2_QUEUE,
-                m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-            m_arbitration_metadata.return_credit(dest_spid);
-            MEMPART_DPRINTF(
-                "mem_fetch request %p return from dram to sub partition %d\n",
-                mf_return, dest_spid);
-          }
-          m_dram_latency_queue.pop_front();
-        } else {
-          break;
-        }
+        if (m_sub_partition[dest_spid]->dram_L2_queue_full()) break;
+      }
+      // A request can carry multiple 32B sectors. Reads and writes use the
+      // same DRAM service timeline after their fixed latency has elapsed.
+      if (--front.service_remaining) continue;
+      m_stats->memlatstat_dram_access(mf_return);
+      if (!writeback) {
+        mf_return->set_reply();
+        m_sub_partition[dest_spid]->dram_L2_queue_push(mf_return);
+        mf_return->set_status(
+            IN_PARTITION_DRAM_TO_L2_QUEUE,
+            m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        m_arbitration_metadata.return_credit(dest_spid);
+        MEMPART_DPRINTF(
+            "mem_fetch request %p return from dram to sub partition %d\n",
+            mf_return, dest_spid);
       } else {
-        // Update stats for simple dram when request is actually dequeued
-        m_stats->memlatstat_dram_access(mf_return);
         this->set_done(mf_return);
         delete mf_return;
-        m_dram_latency_queue.pop_front();
       }
+      m_dram_latency_queue.pop_front();
     } else {
       // The front of the DRAM latency queue is not ready yet, so we cannot
       // process any more requests in this cycle
@@ -319,6 +315,9 @@ void memory_partition_unit::simple_dram_model_cycle() {
       d.req = mf;
       d.ready_cycle = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
                       m_config->dram_latency;
+      d.service_remaining =
+          (mf->get_data_size() + m_config->dram_atom_size - 1) /
+          m_config->dram_atom_size;
       m_dram_latency_queue.push_back(d);
       mf->set_status(IN_PARTITION_DRAM_LATENCY_QUEUE,
                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
@@ -590,14 +589,18 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
 
   if (mf) {
     if (mf->get_type() == WRITE_FORWARD) {
-      // pseudo-coherence update from other chiplet, directly update L2 tag.
+      // A peer update is an in-flight cache access, not a quiescent memcpy.
+      // It can replace dirty data and must wait for the normal cache ports.
       assert(mf->is_write());
-      assert(from_icnt == false);  // can only come from chiplet
-      new_addr_type addr = mf->get_addr();
-      mem_access_sector_mask_t sector_mask = mf->get_access_sector_mask();
-      force_l2_tag_update(addr, cycle, sector_mask);
-      m_chiplet_icnt.from_peer_request()->pop();
-      delete mf;
+      assert(!from_icnt);
+      if (m_L2cache->data_port_free()) {
+        std::list<cache_event> events;
+        if (m_L2cache->access(mf->get_addr(), mf, cycle + m_memcpy_cycle_offset,
+                              events) != RESERVATION_FAIL) {
+          m_chiplet_icnt.from_peer_request()->pop();
+          delete mf;
+        }
+      }
     } else if (!m_config->m_L2_config.disabled() &&
                ((m_config->m_L2_texure_only && mf->istexture()) ||
                 (!m_config->m_L2_texure_only))) {
@@ -823,7 +826,13 @@ unsigned memory_sub_partition::invalidateL2() {
   return 0;
 }
 
-bool memory_sub_partition::busy() const { return !m_request_tracker.empty(); }
+bool memory_sub_partition::busy() const {
+  // Peer updates and cache-generated writebacks can outlive the core request.
+  return !m_request_tracker.empty() ||
+         !m_chiplet_icnt.from_peer_request()->empty() ||
+         !m_chiplet_icnt.from_peer_reply()->empty() ||
+         (!m_config->m_L2_config.disabled() && m_L2cache->pending_requests());
+}
 
 std::vector<mem_fetch *>
 memory_sub_partition::breakdown_request_to_sector_requests(mem_fetch *mf) {
@@ -1083,6 +1092,8 @@ void L2RequestCoalescer::remove_entry(new_addr_type sector_addr, unsigned uid) {
   assert(false && "No matched entry found");
 }
 void L2interface::push(mem_fetch *mf) {
+  if (mf->get_access_type() == L2_WRBK_ACC)
+    m_unit->m_request_tracker.insert(mf);
   mf->set_status(
       IN_PARTITION_L2_TO_DRAM_QUEUE,
       m_unit->m_gpu->gpu_sim_cycle + m_unit->m_gpu->gpu_tot_sim_cycle);
@@ -1107,7 +1118,48 @@ void Chipletinterface::push(mem_fetch *mf) {
 enum cache_request_status l2_cache::access(new_addr_type addr, mem_fetch *mf,
                                            unsigned time,
                                            std::list<cache_event> &events) {
-  return data_cache::access(addr, mf, time, events);
+  if (mf->get_type() != WRITE_FORWARD)
+    return data_cache::access(addr, mf, time, events);
+
+  unsigned index;
+  new_addr_type block_addr = m_config.block_addr(addr);
+  cache_request_status probe =
+      m_tag_array->probe(block_addr, index, mf, true, true);
+  cache_request_status status = RESERVATION_FAIL;
+  // A pending fill owns its reserved sector until it completes. Do not
+  // overwrite it, or evict dirty data without space for its writeback.
+  bool pending = probe == RESERVATION_FAIL || probe == HIT_RESERVED;
+  bool needs_writeback = !pending && probe == MISS &&
+                         m_tag_array->get_block(index)->is_modified_line();
+  if (!pending && !(needs_writeback && miss_queue_full(0))) {
+    bool writeback = false;
+    evicted_block_info evicted;
+    status =
+        m_tag_array->access(block_addr, time, index, writeback, evicted, mf);
+    if (writeback) {
+      mem_fetch *wb = m_memfetch_creator->alloc(
+          evicted.m_block_addr, m_wrbk_type, mf->get_access_warp_mask(),
+          evicted.m_byte_mask, evicted.m_sector_mask, evicted.m_modified_size,
+          true, time, -1, mf->get_sid(), mf->get_tpc(), NULL,
+          mf->get_streamID());
+      wb->set_chip(mf->get_tlx_addr().chip);
+      wb->set_partition(m_sub_partition_id);
+      send_write_request(wb, cache_event(WRITE_BACK_REQUEST_SENT, evicted),
+                         time, events);
+    }
+    // Keep the replica clean on allocation. On a hit, retain any dirty local
+    // stores instead of clearing their state with a forced fill.
+    if (status != HIT) m_tag_array->fill(index, time, mf);
+    m_bandwidth_management.use_data_port(mf, MISS, events);
+    m_bandwidth_management.use_data_port(mf, HIT, events);
+  }
+  m_stats.inc_stats(mf->get_access_type(),
+                    m_stats.select_stats_status(probe, status),
+                    mf->get_streamID());
+  m_stats.inc_stats_pw(mf->get_access_type(),
+                       m_stats.select_stats_status(probe, status),
+                       mf->get_streamID());
+  return status;
 }
 
 void l2_cache::cycle() {

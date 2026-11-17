@@ -1680,7 +1680,9 @@ void scheduler_unit::cycle() {
                 (pI->op == TENSOR_CORE_LOAD_OP) ||
                 (pI->op == TENSOR_CORE_STORE_OP) || (pI->op == FENCE_OP) ||
                 (pI->op == SYNCS_OP) || (pI->op == TMA_OP) ||
-                (pI->op == ARRIVES_OP) || (pI->op == STAS_OP)) {
+                (pI->op == ARRIVES_OP) || (pI->op == STAS_OP) ||
+                (m_shader->m_config->gpgpu_coalesce_arch == 90 &&
+                 pI->is_shuffle())) {
               if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
                                       m_id) &&
                   (!diff_exec_units ||
@@ -1721,19 +1723,27 @@ void scheduler_unit::cycle() {
                     m_int_out->has_free(m_shader->m_config->sub_core_model,
                                         m_id);
 
+                // Hopper IMAD/IMUL uses FMAHeavy, independently of the
+                // integer ALU. The SP unit models the aggregate FMA pipes;
+                // retain the integer instruction's latency and throughput.
+                bool use_sp =
+                    pI->op == SP_OP ||
+                    (m_shader->m_config->gpgpu_coalesce_arch == 90 &&
+                     (pI->is_imul32() || pI->is_imul() || pI->is_imul24()));
+
                 // if INT unit pipline exist, then execute ALU and INT
                 // operations on INT unit and SP-FPU on SP unit (like in Volta)
                 // if INT unit pipline does not exist, then execute all ALU, INT
                 // and SP operations on SP unit (as in Fermi, Pascal GPUs)
                 if (m_shader->m_config->gpgpu_num_int_units > 0 &&
-                    int_pipe_avail && pI->op != SP_OP &&
+                    int_pipe_avail && !use_sp &&
                     !(diff_exec_units &&
                       previous_issued_inst_exec_type == exec_unit_type_t::INT))
                   execute_on_INT = true;
                 else if (sp_pipe_avail &&
                          (m_shader->m_config->gpgpu_num_int_units == 0 ||
                           (m_shader->m_config->gpgpu_num_int_units > 0 &&
-                           pI->op == SP_OP)) &&
+                           use_sp)) &&
                          !(diff_exec_units && previous_issued_inst_exec_type ==
                                                   exec_unit_type_t::SP))
                   execute_on_SP = true;
@@ -2498,67 +2508,86 @@ void ldst_unit::L1_latency_queue_cycle() {
     if ((l1_latency_queue[j][0]) != NULL) {
       mem_fetch *mf_next = l1_latency_queue[j][0];
       std::list<cache_event> events;
-      enum cache_request_status status =
-          m_L1D->access(mf_next->get_addr(), mf_next,
-                        m_core->get_gpu()->gpu_sim_cycle +
-                            m_core->get_gpu()->gpu_tot_sim_cycle,
-                        events);
+      enum cache_request_status status;
+      if (m_l1_hit_writeback[j].empty()) {
+        status = m_L1D->access(mf_next->get_addr(), mf_next,
+                              m_core->get_gpu()->gpu_sim_cycle +
+                                  m_core->get_gpu()->gpu_tot_sim_cycle,
+                              events);
+      } else {
+        // The cache hit has already been charged; only its RF write remains.
+        status = HIT;
+      }
 
       bool write_sent = was_write_sent(events);
       bool read_sent = was_read_sent(events);
 
       if (status == HIT) {
         assert(!read_sent);
-        l1_latency_queue[j][0] = NULL;
+        bool writeback_done = true;
         if (mf_next->get_inst().is_load()) {
-          for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
-            if (mf_next->get_inst().out[r] > 0) {
-              assert(m_pending_writes[mf_next->get_inst().warp_id()]
-                                     [mf_next->get_inst().out[r]] > 0);
-              unsigned still_pending =
-                  --m_pending_writes[mf_next->get_inst().warp_id()]
-                                    [mf_next->get_inst().out[r]];
-              if (!still_pending) {
-                m_pending_writes[mf_next->get_inst().warp_id()].erase(
-                    mf_next->get_inst().out[r]);
-                m_scoreboard->releaseRegister(mf_next->get_inst().warp_id(),
-                                              mf_next->get_inst().out[r]);
-                m_core->warp_inst_complete(mf_next->get_inst());
+          assert(!write_sent);
+          if (m_l1_hit_writeback[j].empty())
+            m_l1_hit_writeback[j] = mf_next->get_inst();
+          writeback_done =
+              m_operand_collector->writeback(m_l1_hit_writeback[j]);
+        }
+        if (writeback_done) {
+          l1_latency_queue[j][0] = NULL;
+          if (mf_next->get_inst().is_load()) {
+            bool completed_load = false;
+            for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
+              if (mf_next->get_inst().out[r] > 0) {
+                assert(m_pending_writes[mf_next->get_inst().warp_id()]
+                                       [mf_next->get_inst().out[r]] > 0);
+                unsigned still_pending =
+                    --m_pending_writes[mf_next->get_inst().warp_id()]
+                                      [mf_next->get_inst().out[r]];
+                if (!still_pending) {
+                  m_pending_writes[mf_next->get_inst().warp_id()].erase(
+                      mf_next->get_inst().out[r]);
+                  m_scoreboard->releaseRegister(mf_next->get_inst().warp_id(),
+                                                mf_next->get_inst().out[r]);
+                  completed_load = true;
+                }
+              }
+            // A vector load has several destinations, but completes once.
+            if (completed_load) m_core->warp_inst_complete(mf_next->get_inst());
+
+            // release LDGSTS
+            if (mf_next->get_inst().m_is_ldgsts) {
+              m_pending_ldgsts[mf_next->get_inst().warp_id()]
+                              [mf_next->get_inst().get_uid()]--;
+              if (m_pending_ldgsts[mf_next->get_inst().warp_id()]
+                                  [mf_next->get_inst().get_uid()] == 0) {
+                // This LDGSTS instruction is done, we remove it
+                // from the pending LDGSTS map and unset the DEPBAR
+                LDST_DPRINTF(
+                    "LDGSTS instruction at PC %llx with uid %d is done, removing "
+                    "it from the pending LDGSTS map and unsetting the DEPBAR\n",
+                    mf_next->get_inst().pc, mf_next->get_inst().get_uid());
+                m_pending_ldgsts[mf_next->get_inst().warp_id()].erase(
+                    mf_next->get_inst().get_uid());
+                m_core->unset_depbar(mf_next->get_inst());
               }
             }
-
-          // release LDGSTS
-          if (mf_next->get_inst().m_is_ldgsts) {
-            m_pending_ldgsts[mf_next->get_inst().warp_id()]
-                            [mf_next->get_inst().get_uid()]--;
-            if (m_pending_ldgsts[mf_next->get_inst().warp_id()]
-                                [mf_next->get_inst().get_uid()] == 0) {
-              // This LDGSTS instruction is done, we remove it
-              // from the pending LDGSTS map and unset the DEPBAR
-              LDST_DPRINTF(
-                  "LDGSTS instruction at PC %llx with uid %d is done, removing "
-                  "it from the pending LDGSTS map and unsetting the DEPBAR\n",
-                  mf_next->get_inst().pc, mf_next->get_inst().get_uid());
-              m_pending_ldgsts[mf_next->get_inst().warp_id()].erase(
-                  mf_next->get_inst().get_uid());
-              m_core->unset_depbar(mf_next->get_inst());
-            }
+            m_l1_hit_writeback[j].clear();
           }
+
+          // For write hit in WB policy
+          if (mf_next->get_inst().is_store() && !write_sent) {
+            unsigned dec_ack =
+                (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
+                    ? (mf_next->get_data_size() / SECTOR_SIZE)
+                    : 1;
+
+            mf_next->set_reply();
+
+            for (unsigned i = 0; i < dec_ack; ++i) m_core->store_ack(mf_next);
+          }
+
+          if (!write_sent) delete mf_next;
         }
-
-        // For write hit in WB policy
-        if (mf_next->get_inst().is_store() && !write_sent) {
-          unsigned dec_ack =
-              (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
-                  ? (mf_next->get_data_size() / SECTOR_SIZE)
-                  : 1;
-
-          mf_next->set_reply();
-
-          for (unsigned i = 0; i < dec_ack; ++i) m_core->store_ack(mf_next);
-        }
-
-        if (!write_sent) delete mf_next;
 
       } else if (status == RESERVATION_FAIL) {
         assert(!read_sent);
@@ -3052,6 +3081,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
                          IN_L1D_MISS_QUEUE, core->get_gpu(), L1_GPU_CACHE);
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
+    m_l1_hit_writeback.resize(m_config->m_L1D_config.l1_banks);
     assert(m_config->m_L1D_config.l1_latency > 0);
 
     for (unsigned j = 0; j < m_config->m_L1D_config.l1_banks; j++)
@@ -3124,8 +3154,10 @@ void ldst_unit::issue(register_set &reg_set) {
     }
   }
   // stat collection
-  m_core->mem_instruction_stats(*inst);
-  m_core->incmem_stat(m_core->get_config()->warp_size, 1);
+  if (!inst->is_shuffle()) {
+    m_core->mem_instruction_stats(*inst);
+    m_core->incmem_stat(m_core->get_config()->warp_size, 1);
+  }
   pipelined_simd_unit::issue(reg_set);
 }
 
@@ -3133,7 +3165,7 @@ bool ldst_unit::writeback_complete(warp_inst_t &inst) {
   bool insn_completed = false;
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst.out[r] > 0) {
-      if (inst.space.get_type() != shared_space) {
+      if (inst.space.get_type() != shared_space && !inst.is_shuffle()) {
         assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
         unsigned still_pending =
             --m_pending_writes[inst.warp_id()][inst.out[r]];
@@ -3142,7 +3174,7 @@ bool ldst_unit::writeback_complete(warp_inst_t &inst) {
           m_scoreboard->releaseRegister(inst.warp_id(), inst.out[r]);
           insn_completed = true;
         }
-      } else {  // shared
+      } else {  // shared load or register shuffle
         m_scoreboard->releaseRegister(inst.warp_id(), inst.out[r]);
         insn_completed = true;
       }
@@ -3204,6 +3236,15 @@ void ldst_unit::writeback() {
           }
           m_core->dec_inst_in_pipeline(m_pipeline_reg[0]->warp_id());
           m_pipeline_reg[0]->clear();
+          serviced_client = next_client;
+        }
+        break;
+      case WB_CLIENT_SHFL:
+        if (!m_pipeline.empty() && m_pipeline.front().ready_cycle <=
+                                       m_core->get_gpu()->global_cycle()) {
+          m_next_wb = m_pipeline.front().inst;
+          m_core->dec_inst_in_pipeline(m_next_wb.warp_id());
+          m_pipeline.pop_front();
           serviced_client = next_client;
         }
         break;
@@ -3747,7 +3788,17 @@ void ldst_unit::cycle() {
 
   if (!pipe_reg.empty()) {
     unsigned warp_id = pipe_reg.warp_id();
-    if (pipe_reg.is_load()) {
+    if (pipe_reg.is_shuffle()) {
+      // Register shuffles share LSU issue and writeback bandwidth, but not
+      // the shared-load transit stages. A short result must not block a
+      // longer shared read moving through those stages.
+      if (m_pipeline.size() < pipe_reg.latency) {
+        m_pipeline.push_back(
+            {pipe_reg, static_cast<unsigned>(m_core->get_gpu()->global_cycle() +
+                                             pipe_reg.latency)});
+        m_dispatch_reg->clear();
+      }
+    } else if (pipe_reg.is_load()) {
       if (pipe_reg.space.get_type() == shared_space) {
         if (m_pipeline_reg[m_config->smem_latency - 1]->empty()) {
           // new shared memory request
@@ -4360,6 +4411,7 @@ void shader_core_ctx::incexecstat(warp_inst_t *&inst) {
   if (get_gpu()->get_config().g_power_simulation_enabled) {
     switch (inst->sp_op) {
       case INT__OP:
+      case SHFL__OP:
         incialu_stat(inst->active_count(), scaling_coeffs->int_coeff);
         break;
       case INT_MUL_OP:
@@ -5454,6 +5506,9 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
 }
 
 void opndcoll_rfu_t::dispatch_ready_cu() {
+  // Shared operand reads can be pipelined while an older GMMA waits in OC_EX.
+  // Keep the collected instruction in its existing, bounded collector slot.
+  for (auto *cu : m_cu) cu->collect_ptx_matrix(m_shader);
   for (unsigned p = 0; p < m_dispatch_units.size(); ++p) {
     dispatch_unit_t &du = m_dispatch_units[p];
     collector_unit_t *cu = du.find_ready();
@@ -5563,15 +5618,29 @@ void opndcoll_rfu_t::allocate_reads() {
   }
 }
 
-bool opndcoll_rfu_t::collector_unit_t::ready() const {
+bool opndcoll_rfu_t::collector_unit_t::operands_ready() const {
   // A later accumulator chain can finish collecting first. Keep each warp's
   // GMMA order so it cannot occupy the dispatch slot needed by its predecessor.
   if (!m_free && m_warp->m_ptx_matrix == PTX_WGMMA &&
       m_warp->m_ptx_matrix_sequence !=
           m_warp->m_ptx_matrix_group->collector_next[m_warp->m_ptx_matrix_warp])
     return false;
-  return (!m_free) && m_not_ready.none() &&
-         (*m_output_register).has_free(m_sub_core_model, m_reg_id);
+  return (!m_free) && m_not_ready.none();
+}
+
+bool opndcoll_rfu_t::collector_unit_t::ready() const {
+  if (!operands_ready()) return false;
+  // Admit a complete warpgroup operation. Partial operations from different
+  // warpgroups can otherwise occupy OC_EX and block each other's missing warps.
+  if (m_warp->m_ptx_matrix_op && m_warp->m_ptx_matrix_op->collected != 15)
+    return false;
+  return m_output_register->has_free(m_sub_core_model, m_reg_id);
+}
+
+void opndcoll_rfu_t::collector_unit_t::collect_ptx_matrix(
+    shader_core_ctx *shader) const {
+  if (operands_ready() && m_warp->m_ptx_matrix_op)
+    shader->collect_ptx_matrix(*m_warp);
 }
 
 void opndcoll_rfu_t::collector_unit_t::dump(
@@ -6159,6 +6228,7 @@ void opndcoll_simple_t::step() {
       if (inst->empty()) {
         continue;
       }
+      if (inst->m_ptx_matrix_op) m_shader->collect_ptx_matrix(*inst);
       if (out->has_free(sub_core_model, reg_id)) {
         in->move_out_to(sub_core_model, reg_id, m_swap_buffer);
         out->move_in(sub_core_model, reg_id, m_swap_buffer);
@@ -6256,8 +6326,12 @@ void ldst_unit::service_ptx_tensor() {
 }
 
 bool specialized_unit::can_issue(const warp_inst_t &inst) const {
-  return inst.op == m_supported_op && pipelined_simd_unit::can_issue(inst) &&
-         (!inst.m_ptx_matrix_op || m_core->prepare_ptx_matrix(inst));
+  if (inst.op != m_supported_op) return false;
+  // Shared reads were reserved by the collectors. Wait for their delivery and
+  // accumulator predecessors before computing; architectural results remain
+  // pending until pipeline writeback.
+  if (inst.m_ptx_matrix_op && !m_core->prepare_ptx_matrix(inst)) return false;
+  return pipelined_simd_unit::can_issue(inst);
 }
 
 uint64_t ldst_unit::reserve_ptx_matrix_shared(unsigned bytes) {
@@ -6269,24 +6343,34 @@ uint64_t ldst_unit::reserve_ptx_matrix_shared(unsigned bytes) {
   return m_ptx_tensor_shared_available + m_config->smem_latency;
 }
 
-bool shader_core_ctx::prepare_ptx_matrix(const warp_inst_t &inst) {
+void shader_core_ctx::collect_ptx_matrix(const warp_inst_t &inst) {
   auto &op = *inst.m_ptx_matrix_op;
+  if (DTRACE(PTX_TMA) && !(op.collected & (1 << inst.m_ptx_matrix_warp)))
+    printf(
+        "PTX_GMMA collected cycle=%llu sid=%u uid=%u seq=%u warp=%u wid=%u\n",
+        m_gpu->global_cycle(), m_sid, inst.get_uid(),
+        inst.m_ptx_matrix_sequence, inst.m_ptx_matrix_warp, inst.warp_id());
   op.collected |= 1 << inst.m_ptx_matrix_warp;
-  if (op.collected != 15) return false;
-  for (const auto &source : op.source)
-    if (source && !source->computed) return false;
+  if (op.collected != 15) return;
   if (!op.read_ready) {
     op.read_ready =
         m_ldst_unit->reserve_ptx_matrix_shared(64 * 16 * 2 + 128 * 16 * 2);
     if (DTRACE(PTX_TMA))
       printf(
           "PTX_GMMA read cycle=%llu seq=%u ready=%llu math=262144 "
-          "uid=%u a=%llx b=%llx\n",
+          "uid=%u a=%llx b=%llx sid=%u warp=%u\n",
           m_gpu->global_cycle(), inst.m_ptx_matrix_sequence,
           (unsigned long long)op.read_ready, inst.get_uid(),
           (unsigned long long)op.warps[0]->a,
-          (unsigned long long)op.warps[0]->b);
+          (unsigned long long)op.warps[0]->b, m_sid, inst.warp_id());
   }
+}
+
+bool shader_core_ctx::prepare_ptx_matrix(const warp_inst_t &inst) {
+  auto &op = *inst.m_ptx_matrix_op;
+  if (op.collected != 15) return false;
+  for (const auto &source : op.source)
+    if (source && !source->computed) return false;
   if (m_gpu->global_cycle() < op.read_ready) return false;
   if (!op.computed) {
     op.compute();
@@ -6346,9 +6430,9 @@ void shader_core_ctx::issue_ptx_matrix(warp_inst_t &inst) {
     if (DTRACE(PTX_TMA)) {
       printf(
           "PTX_GMMA arrive cycle=%llu uid=%u seq=%u warp=%u mask=%u inputs=%u "
-          "outputs=%u\n",
+          "outputs=%u sid=%u wid=%u\n",
           m_gpu->global_cycle(), inst.get_uid(), seq, w, op->arrived,
-          inst.incount, inst.outcount);
+          inst.incount, inst.outcount, m_sid, inst.warp_id());
       for (unsigned j = 0; j < 64; ++j)
         printf("PTX_GMMA tuple uid=%u j=%u name=%s reg=%u out=%u dst=%d\n",
                inst.get_uid(), j, values.dst[j]->name().c_str(),

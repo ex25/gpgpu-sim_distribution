@@ -198,6 +198,7 @@ class l2_cache : public data_cache {
                                            unsigned time,
                                            std::list<cache_event> &events);
   void cycle();
+  bool pending_requests() const { return !m_miss_queue.empty(); }
 
  private:
   mem_fetch_interface *m_chiplet_port;
@@ -322,6 +323,7 @@ class memory_partition_unit {
   struct dram_delay_t {
     unsigned long long ready_cycle;
     class mem_fetch *req;
+    unsigned service_remaining = 0;  // simple DRAM data ticks
   };
   std::list<dram_delay_t> m_dram_latency_queue;
 

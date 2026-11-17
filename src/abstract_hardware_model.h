@@ -202,7 +202,8 @@ enum special_operations_t {
   DP_DIV_OP,
   DP___OP,
   TENSOR__OP,
-  TEX__OP
+  TEX__OP,
+  SHFL__OP
 };
 
 typedef enum special_operations_t
@@ -1457,7 +1458,8 @@ class inst_t {
             (sp_op == FP_SIN_OP) || (sp_op == FP_EXP_OP) ||
             (sp_op == TENSOR__OP));
   }
-  bool is_alu() const { return (sp_op == INT__OP); }
+  bool is_shuffle() const { return sp_op == SHFL__OP; }
+  bool is_alu() const { return sp_op == INT__OP || is_shuffle(); }
   bool is_fence() const { return (op == FENCE_OP); }
   bool is_syncs() const { return (op == SYNCS_OP); }
   bool is_shmem_load() const {

@@ -1379,7 +1379,9 @@ class opndcoll_rfu_t
       m_num_banks = 0;
     }
     // accessors
+    bool operands_ready() const;
     bool ready() const;
+    void collect_ptx_matrix(shader_core_ctx *shader) const;
     const op_t *get_operands() const { return m_src_op; }
     void dump(FILE *fp, const shader_core_ctx *shader) const;
 
@@ -1816,6 +1818,9 @@ class ldst_unit : public pipelined_simd_unit {
 
   virtual bool can_issue(const warp_inst_t &inst) const {
     switch (inst.op) {
+      case ALU_OP:
+        if (!inst.is_shuffle()) return false;
+        break;
       case LOAD_OP:
         break;
       case TENSOR_CORE_LOAD_OP:
@@ -2107,6 +2112,7 @@ class ldst_unit : public pipelined_simd_unit {
   unsigned m_num_writeback_clients;
   typedef enum {
     WB_CLIENT_SHARED = 0,
+    WB_CLIENT_SHFL,
     WB_CLIENT_L1T,
     WB_CLIENT_L1C,
     WB_CLIENT_GLOBAL,
@@ -2126,6 +2132,8 @@ class ldst_unit : public pipelined_simd_unit {
   unsigned long long m_last_inst_gpu_tot_sim_cycle;
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
+  // A hit stays at the head of its L1 bank until all register writes complete.
+  std::vector<warp_inst_t> m_l1_hit_writeback;
   void L1_latency_queue_cycle();
 
   // For fence
@@ -3299,6 +3307,7 @@ class shader_core_ctx : public core_t {
   uint64_t m_last_cta_issue_cycle = uint64_t(-1);
   std::map<unsigned, ptx_matrix_cta> m_ptx_matrix_ctas;
   void issue_ptx_matrix(warp_inst_t &inst);
+  void collect_ptx_matrix(const warp_inst_t &inst);
   bool prepare_ptx_matrix(const warp_inst_t &inst);
   bool can_issue_1block(kernel_info_t &kernel);
   bool occupy_shader_resource_1block(kernel_info_t &kernel, bool occupy);

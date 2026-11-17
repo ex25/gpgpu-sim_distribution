@@ -338,8 +338,67 @@ void warp_inst_t::generate_mem_accesses() {
       unsigned total_accesses = 0;
       for (unsigned subwarp = 0; subwarp < m_config->mem_warp_parts;
            subwarp++) {
+        if ((op == LOAD_OP || op == STORE_OP) &&
+            m_config->gpgpu_coalesce_arch == 90 &&
+            !m_config->shmem_limited_broadcast &&
+            m_ptx_matrix != PTX_LDMATRIX && m_ptx_matrix != PTX_STMATRIX) {
+          // Hopper wide loads use fixed lane groups, not a greedy packing of
+          // unique words. A warp-wide pair broadcast (lane xor 1 or xor 2)
+          // doubles the load group. H100 v2/v4 measurements distinguish this
+          // from both fixed 8-lane splitting and unique-word packing.
+          unsigned first_lane = subwarp * subwarp_size;
+          unsigned end_lane = first_lane + subwarp_size;
+          unsigned request_lanes =
+              std::min(subwarp_size, 128 / std::max(4u, data_size));
+          if (op == LOAD_OP && !isatomic() &&
+              (data_size == 8 || data_size == 16)) {
+            bool broadcast = false;
+            for (unsigned bit = 1; bit <= 2; bit <<= 1) {
+              bool paired = true;
+              for (unsigned lane = first_lane; lane < end_lane; ++lane) {
+                unsigned partner = lane ^ bit;
+                if (active(lane) && active(partner) &&
+                    m_per_scalar_thread[lane].memreqaddr[0] !=
+                        m_per_scalar_thread[partner].memreqaddr[0]) {
+                  paired = false;
+                  break;
+                }
+              }
+              broadcast |= paired;
+            }
+            if (broadcast)
+              request_lanes = std::min(subwarp_size, request_lanes * 2);
+          }
+          for (unsigned first = first_lane; first < end_lane;
+               first += request_lanes) {
+            std::map<unsigned, std::map<new_addr_type, unsigned>> banks;
+            for (unsigned lane = first;
+                 lane < std::min(end_lane, first + request_lanes); ++lane) {
+              if (!active(lane)) continue;
+              assert(m_per_scalar_thread[lane].memreqaddr_count == 1);
+              new_addr_type addr = m_per_scalar_thread[lane].memreqaddr[0];
+              new_addr_type last = line_size_based_tag_func(
+                  addr + data_size - 1, m_config->WORD_SIZE);
+              for (new_addr_type word =
+                       line_size_based_tag_func(addr, m_config->WORD_SIZE);
+                   word <= last; word += m_config->WORD_SIZE)
+                ++banks[m_config->shmem_bank_func(word)][word];
+            }
+            unsigned service = 0;
+            for (const auto &bank : banks) {
+              unsigned words = 0;
+              for (const auto &word : bank.second)
+                // Atomics modify each lane's value; same-word operations
+                // serialize rather than broadcasting one read result.
+                words += isatomic() ? word.second : 1;
+              service = std::max(service, words);
+            }
+            total_accesses += service;
+          }
+          continue;
+        }
         // data structures used per part warp
-        std::map<unsigned, std::map<new_addr_type, unsigned> >
+        std::map<unsigned, std::map<new_addr_type, unsigned>>
             bank_accs;  // bank -> word address -> access count
 
         // step 1: compute accesses to words in banks
@@ -429,7 +488,12 @@ void warp_inst_t::generate_mem_accesses() {
           total_accesses += max_bank_accesses;
         }
       }
-      assert(total_accesses > 0 && total_accesses <= m_config->warp_size);
+      assert(
+          total_accesses > 0 &&
+          total_accesses <=
+              m_config->warp_size *
+                  std::max(1u, unsigned((data_size + m_config->WORD_SIZE - 1) /
+                                        m_config->WORD_SIZE)));
       cycles = total_accesses;  // shared memory conflicts modeled as larger
                                 // initiation interval
       m_config->gpgpu_ctx->stats->ptx_file_line_stats_add_smem_bank_conflict(
@@ -569,38 +633,19 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
       // Iterate over addresses for coalescing
       for (unsigned access = 0; access < address_count; ++access) {
         new_addr_type addr = addresses[access];
-        new_addr_type block_address =
-            line_size_based_tag_func(addr, segment_size);
-        unsigned chunk =
-            (addr & 127) / 32;  // which 32-byte chunk within in a 128-byte
-                                // chunk does this thread access?
-        transaction_info &info = subwarp_transactions[block_address];
-
-        // can only write to one segment
-        // it seems like in trace driven, a thread can write to more than one
-        // segment assert(block_address ==
-        // line_size_based_tag_func(addr+data_size_coales-1,segment_size));
-
-        info.chunks.set(chunk);
-        info.active.set(thread);
-        unsigned idx = (addr & 127);
-        for (unsigned i = 0; i < data_size_coales; i++)
-          if ((idx + i) < MAX_MEMORY_ACCESS_SIZE) info.bytes.set(idx + i);
-
-        // it seems like in trace driven, a thread can write to more than one
-        // segment handle this special case
-        if (block_address != line_size_based_tag_func(
-                                 addr + data_size_coales - 1, segment_size)) {
-          addr = addr + data_size_coales - 1;
-          new_addr_type block_address =
+        const new_addr_type end = addr + data_size_coales;
+        // A lane can cross both 32B sector and coalescing segment boundaries.
+        // Record only its bytes in each segment's 128B-relative byte mask.
+        while (addr < end) {
+          const new_addr_type block_address =
               line_size_based_tag_func(addr, segment_size);
-          unsigned chunk = (addr & 127) / 32;
+          const new_addr_type sector_end =
+              line_size_based_tag_func(addr, 32) + 32;
+          const new_addr_type part_end = std::min(end, sector_end);
           transaction_info &info = subwarp_transactions[block_address];
-          info.chunks.set(chunk);
+          info.chunks.set((addr & 127) / 32);
           info.active.set(thread);
-          unsigned idx = (addr & 127);
-          for (unsigned i = 0; i < data_size_coales; i++)
-            if ((idx + i) < MAX_MEMORY_ACCESS_SIZE) info.bytes.set(idx + i);
+          for (; addr < part_end; ++addr) info.bytes.set(addr & 127);
         }
       }
     }
